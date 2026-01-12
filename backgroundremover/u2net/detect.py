@@ -78,6 +78,9 @@ def load_model(model_name: str = "u2net"):
         if torch.cuda.is_available():
             net.load_state_dict(torch.load(path))
             net.to(torch.device("cuda"))
+        elif torch.backends.mps.is_available():
+            net.load_state_dict(torch.load(path, map_location="mps"))
+            net.to(torch.device("mps"))
         else:
             net.load_state_dict(
                 torch.load(
@@ -156,6 +159,10 @@ def predict(net, item):
             inputs_test = torch.cuda.FloatTensor(
                 sample["image"].unsqueeze(0).cuda().float()
             )
+        elif torch.backends.mps.is_available():
+            inputs_test = torch.FloatTensor(
+                sample["image"].unsqueeze(0).float()
+            ).to(torch.device("mps"))
         else:
             inputs_test = torch.FloatTensor(sample["image"].unsqueeze(0).float())
 

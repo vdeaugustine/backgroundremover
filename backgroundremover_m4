@@ -1,0 +1,14 @@
+#!/bin/zsh
+# Wrapper script for BackgroundRemover on M4 Max
+# Activates the virtual environment and runs the CLI
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(dirname "$0")"
+
+# Activate the virtual environment
+source "$SCRIPT_DIR/venv/bin/activate"
+
+# Run the backgroundremover CLI with all passed arguments
+# We encourage using specific flags for M4 Max efficiency in the user instructions,
+# but here we just pass through arguments to keep it flexible.
+python -m backgroundremover.cmd.cli "$@"
