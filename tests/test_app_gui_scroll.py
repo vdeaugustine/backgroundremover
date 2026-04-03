@@ -107,6 +107,57 @@ class FrameSidebarScrollTests(unittest.TestCase):
 
         self.assertEqual(self.app.video_output_prefix.get(), "dog-run")
 
+    def test_frame_results_area_uses_resizable_paned_layout(self):
+        self.assertTrue(hasattr(self.app, "frame_results_paned"))
+        self.assertEqual(str(self.app.frame_results_paned.cget("orient")), "horizontal")
+
+    def test_frame_navigation_moves_selection_with_arrow_keys(self):
+        frame_items = [
+            {
+                "index": 0,
+                "name": "Frame 1",
+                "path": __file__,
+                "size": (10, 10),
+                "thumbnail": mock.Mock(),
+                "compare_array": np.zeros((4, 4), dtype=np.float32),
+            },
+            {
+                "index": 1,
+                "name": "Frame 2",
+                "path": __file__,
+                "size": (10, 10),
+                "thumbnail": mock.Mock(),
+                "compare_array": np.ones((4, 4), dtype=np.float32),
+            },
+        ]
+
+        def fake_show_preview(index):
+            self.app.current_frame_index = index
+
+        with mock.patch.object(self.app, "_add_frame_thumbnail"), mock.patch.object(
+            self.app,
+            "_show_frame_preview",
+            side_effect=fake_show_preview,
+        ) as show_preview:
+            self.app.all_extracted_frame_items = list(frame_items)
+            self.app._rebuild_frame_list(frame_items)
+
+            self.assertEqual(self.app.current_frame_index, 0)
+            show_preview.reset_mock()
+
+            self.app.select_next_frame()
+            self.assertEqual(self.app.current_frame_index, 1)
+            show_preview.assert_called_once_with(1)
+            show_preview.reset_mock()
+
+            self.app.select_next_frame()
+            self.assertEqual(self.app.current_frame_index, 1)
+            show_preview.assert_not_called()
+
+            self.app.select_previous_frame()
+            self.assertEqual(self.app.current_frame_index, 0)
+            show_preview.assert_called_once_with(0)
+
 
 class FrameDeduplicationTests(unittest.TestCase):
     def _item(self, index, compare_array):

@@ -8,6 +8,7 @@ Optimized for Apple Silicon (M-series) with MPS acceleration.
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
+from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, ThreadPoolExecutor, wait
 import os
 import sys
 import shutil
@@ -24,6 +25,8 @@ DEDUPLICATION_THRESHOLD_MAX = 0.050
 COLOR_CLEANUP_THRESHOLD_MIN = 0
 COLOR_CLEANUP_THRESHOLD_MAX = 120
 COLOR_CLEANUP_THRESHOLD_DEFAULT = 15
+MAX_COLOR_CLEANUP_WORKERS = 4
+MAX_PENDING_COLOR_CLEANUP_TASKS_PER_WORKER = 2
 
 # Handle running from app bundle
 if getattr(sys, 'frozen', False):
@@ -131,6 +134,20 @@ def apply_color_cleanup(image, cleanup_colors, threshold=0):
 
     pixel_array[matched_mask, 3] = 0
     return Image.fromarray(pixel_array)
+
+
+def resolve_color_cleanup_worker_count(frame_count):
+    """Choose a bounded worker count for asynchronous color cleanup and saves."""
+    available_cpus = os.cpu_count() or 1
+    return max(1, min(MAX_COLOR_CLEANUP_WORKERS, available_cpus, int(frame_count or 1)))
+
+
+def finalize_processed_cutout(cutout, destination, cleanup_colors, cleanup_threshold):
+    """Run the final cleanup pass, crop, and save one processed frame."""
+    finalized = apply_color_cleanup(cutout, cleanup_colors or [], cleanup_threshold)
+    finalized = crop_to_visible_bounds(finalized)
+    finalized.save(destination, "PNG")
+    return destination
 
 
 class ModernStyle:
@@ -312,10 +329,27 @@ class BackgroundRemoverApp:
     
     def create_widgets(self):
         """Create the main UI"""
-        main_frame = ttk.Frame(self.root, padding="20")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self.app_shell = tk.Canvas(
+            self.root,
+            bg=ModernStyle.BG_PRIMARY,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.app_shell.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        notebook = ttk.Notebook(main_frame)
+        self.app_scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self.app_shell.yview)
+        self.app_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.app_shell.configure(yscrollcommand=self.app_scrollbar.set)
+
+        self.app_content = ttk.Frame(self.app_shell, padding="20")
+        self.app_shell_window = self.app_shell.create_window((0, 0), window=self.app_content, anchor="nw")
+        self.app_content.bind("<Configure>", self._on_app_content_configure)
+        self.app_shell.bind("<Configure>", self._on_app_shell_resize)
+        self.app_shell.bind_all("<MouseWheel>", self._on_app_mousewheel, add="+")
+        self.app_shell.bind_all("<Button-4>", self._on_app_mousewheel, add="+")
+        self.app_shell.bind_all("<Button-5>", self._on_app_mousewheel, add="+")
+
+        notebook = ttk.Notebook(self.app_content)
         notebook.pack(fill=tk.BOTH, expand=True)
 
         image_tab = ttk.Frame(notebook, padding="20")
@@ -837,16 +871,15 @@ class BackgroundRemoverApp:
         )
         self.video_status_label.pack(anchor=tk.W, pady=(0, 15))
 
-        content_frame = ttk.Frame(parent)
-        content_frame.pack(fill=tk.BOTH, expand=True)
+        self.frame_results_paned = ttk.Panedwindow(parent, orient=tk.HORIZONTAL)
+        self.frame_results_paned.pack(fill=tk.BOTH, expand=True)
 
         sidebar_container = tk.Frame(
-            content_frame,
+            self.frame_results_paned,
             bg=ModernStyle.BG_SECONDARY,
             highlightthickness=1,
             highlightbackground=ModernStyle.BORDER,
         )
-        sidebar_container.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         sidebar_container.configure(width=280)
         sidebar_container.pack_propagate(False)
 
@@ -882,12 +915,13 @@ class BackgroundRemoverApp:
         self._bind_frame_list_scrolling()
 
         preview_container = tk.Frame(
-            content_frame,
+            self.frame_results_paned,
             bg=ModernStyle.BG_SECONDARY,
             highlightthickness=1,
             highlightbackground=ModernStyle.BORDER,
         )
-        preview_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.frame_results_paned.add(sidebar_container, weight=1)
+        self.frame_results_paned.add(preview_container, weight=3)
 
         tk.Label(
             preview_container,
@@ -918,6 +952,7 @@ class BackgroundRemoverApp:
         )
         self.frame_preview_meta.pack(fill=tk.X, padx=14, pady=(0, 14))
         self._refresh_video_cleanup_controls()
+        self._bind_frame_navigation()
     
     def center_window(self):
         """Center the window on screen"""
@@ -927,6 +962,26 @@ class BackgroundRemoverApp:
         x = (self.root.winfo_screenwidth() // 2) - (width // 2)
         y = (self.root.winfo_screenheight() // 2) - (height // 2)
         self.root.geometry(f'+{x}+{y}')
+
+    def _on_app_content_configure(self, _event=None):
+        self.app_shell.configure(scrollregion=self.app_shell.bbox("all"))
+
+    def _on_app_shell_resize(self, event):
+        self.app_shell.itemconfigure(self.app_shell_window, width=event.width)
+
+    def _on_app_mousewheel(self, event):
+        if getattr(event, "num", None) == 4:
+            step = -1
+        elif getattr(event, "num", None) == 5:
+            step = 1
+        else:
+            delta = getattr(event, "delta", 0)
+            if delta == 0:
+                return None
+            step = -1 * int(delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+
+        self.app_shell.yview_scroll(step, "units")
+        return "break"
 
     def on_close(self):
         """Clean up temporary files before closing the app"""
@@ -1307,6 +1362,40 @@ class BackgroundRemoverApp:
     def _current_frame_item(self):
         return next((item for item in self.frame_items if item["index"] == self.current_frame_index), None)
 
+    def _select_frame_by_index(self, target_index):
+        matching = next((item for item in self.frame_items if item["index"] == target_index), None)
+        if matching is None:
+            return False
+
+        self._show_frame_preview(target_index)
+        return True
+
+    def select_previous_frame(self, _event=None):
+        if not self.frame_items or self.current_frame_index is None:
+            return "break"
+
+        current_position = next((i for i, item in enumerate(self.frame_items) if item["index"] == self.current_frame_index), None)
+        if current_position is None or current_position == 0:
+            return "break"
+
+        self._select_frame_by_index(self.frame_items[current_position - 1]["index"])
+        return "break"
+
+    def select_next_frame(self, _event=None):
+        if not self.frame_items or self.current_frame_index is None:
+            return "break"
+
+        current_position = next((i for i, item in enumerate(self.frame_items) if item["index"] == self.current_frame_index), None)
+        if current_position is None or current_position >= len(self.frame_items) - 1:
+            return "break"
+
+        self._select_frame_by_index(self.frame_items[current_position + 1]["index"])
+        return "break"
+
+    def _bind_frame_navigation(self):
+        self.root.bind_all("<Up>", self.select_previous_frame, add="+")
+        self.root.bind_all("<Down>", self.select_next_frame, add="+")
+
     def _on_frame_preview_click(self, event):
         if not self.preview_color_pick_active or self.current_frame_index is None or self.frame_preview_photo is None:
             return
@@ -1674,31 +1763,75 @@ class BackgroundRemoverApp:
         )
         thread.start()
 
+    def _drain_completed_export_futures(self, pending_futures, saved_paths_by_position, wait_for_all=False):
+        """Collect completed async cleanup/save tasks and preserve export order."""
+        if not pending_futures:
+            return
+
+        done_futures, _ = wait(
+            pending_futures.keys(),
+            return_when=ALL_COMPLETED if wait_for_all else FIRST_COMPLETED,
+        )
+        for completed_future in done_futures:
+            position = pending_futures.pop(completed_future)
+            saved_paths_by_position[position] = completed_future.result()
+
     def _remove_background_and_save_selected_frames_thread(self, selected_items, target_dir, output_prefix, model_name, alpha_matting, cleanup_colors=None, cleanup_threshold=0):
         """Batch-remove backgrounds for selected frame images and save them as PNGs."""
         try:
-            saved_paths = []
+            saved_paths_by_position = {}
             net = self._load_model(model_name)
+            cleanup_colors = list(cleanup_colors or [])
+            worker_count = resolve_color_cleanup_worker_count(len(selected_items))
+            max_pending_tasks = max(1, worker_count * MAX_PENDING_COLOR_CLEANUP_TASKS_PER_WORKER)
 
-            for position, item in enumerate(selected_items, start=1):
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                pending_futures = {}
+
+                for position, item in enumerate(selected_items, start=1):
+                    self.root.after(
+                        0,
+                        lambda current=position, total=len(selected_items): self.video_status_label.configure(
+                            text=(
+                                f"Removing backgrounds... {current}/{total} "
+                                f"(cleanup/saving runs in parallel)"
+                            ),
+                            foreground=ModernStyle.TEXT_SECONDARY,
+                        ),
+                    )
+                    with Image.open(item["path"]) as opened_image:
+                        img = opened_image.convert("RGB")
+                    cutout = self._create_cutout_for_image(img, net, alpha_matting)
+                    destination = os.path.join(
+                        target_dir,
+                        build_export_filename(output_prefix, position, suffix="_no_bg"),
+                    )
+                    future = executor.submit(
+                        finalize_processed_cutout,
+                        cutout,
+                        destination,
+                        cleanup_colors,
+                        cleanup_threshold,
+                    )
+                    pending_futures[future] = position
+
+                    if len(pending_futures) >= max_pending_tasks:
+                        self._drain_completed_export_futures(pending_futures, saved_paths_by_position)
+
                 self.root.after(
                     0,
-                    lambda current=position, total=len(selected_items): self.video_status_label.configure(
-                        text=f"Removing backgrounds... {current}/{total}",
+                    lambda total=len(selected_items): self.video_status_label.configure(
+                        text=f"Finalizing cleaned exports... {len(saved_paths_by_position)}/{total}",
                         foreground=ModernStyle.TEXT_SECONDARY,
                     ),
                 )
-                with Image.open(item["path"]) as opened_image:
-                    img = opened_image.convert("RGB")
-                cutout = self._create_cutout_for_image(img, net, alpha_matting)
-                cutout = apply_color_cleanup(cutout, cleanup_colors or [], cleanup_threshold)
-                cutout = crop_to_visible_bounds(cutout)
-                destination = os.path.join(
-                    target_dir,
-                    build_export_filename(output_prefix, position, suffix="_no_bg"),
+                self._drain_completed_export_futures(
+                    pending_futures,
+                    saved_paths_by_position,
+                    wait_for_all=True,
                 )
-                cutout.save(destination, "PNG")
-                saved_paths.append(destination)
+
+            saved_paths = [saved_paths_by_position[position] for position in sorted(saved_paths_by_position)]
 
             self.root.after(0, lambda: self._on_background_frames_saved(saved_paths, target_dir))
         except Exception as e:
