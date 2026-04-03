@@ -19,6 +19,8 @@ import numpy as np
 
 DUPLICATE_FRAME_SIGNATURE_SIZE = (24, 24)
 DUPLICATE_FRAME_MAX_MEAN_DIFFERENCE = 0.015
+DEDUPLICATION_THRESHOLD_MIN = 0.001
+DEDUPLICATION_THRESHOLD_MAX = 0.050
 
 # Handle running from app bundle
 if getattr(sys, 'frozen', False):
@@ -215,9 +217,11 @@ class BackgroundRemoverApp:
         self.frame_temp_dir = None
         self.video_clip_metadata = {}
         self.full_frame_count = 0
+        self.all_extracted_frame_items = []
         self.video_bg_model_choice = tk.StringVar(value="u2net")
         self.video_bg_alpha_matting = tk.BooleanVar(value=False)
         self.video_output_prefix = tk.StringVar()
+        self.deduplication_threshold = tk.DoubleVar(value=DUPLICATE_FRAME_MAX_MEAN_DIFFERENCE)
         
         # Configure styles
         self.setup_styles()
@@ -579,6 +583,42 @@ class BackgroundRemoverApp:
         )
         self.video_output_prefix_entry.pack(fill=tk.X, pady=(5, 0), ipady=8)
 
+        dedupe_frame = ttk.Frame(parent)
+        dedupe_frame.pack(fill=tk.X, pady=(0, 15))
+
+        threshold_header = ttk.Frame(dedupe_frame)
+        threshold_header.pack(fill=tk.X)
+        ttk.Label(threshold_header, text="Duplicate Threshold").pack(side=tk.LEFT)
+        self.deduplication_threshold_value_label = ttk.Label(
+            threshold_header,
+            text=f"{self.deduplication_threshold.get():.3f}",
+            style='Small.TLabel',
+        )
+        self.deduplication_threshold_value_label.pack(side=tk.RIGHT)
+
+        self.deduplication_threshold_scale = tk.Scale(
+            dedupe_frame,
+            from_=DEDUPLICATION_THRESHOLD_MIN,
+            to=DEDUPLICATION_THRESHOLD_MAX,
+            resolution=0.001,
+            orient=tk.HORIZONTAL,
+            variable=self.deduplication_threshold,
+            command=self._on_deduplication_threshold_change,
+            bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            troughcolor=ModernStyle.BG_TERTIARY,
+            activebackground=ModernStyle.ACCENT,
+            highlightthickness=0,
+            font=ModernStyle.FONT_SMALL,
+        )
+        self.deduplication_threshold_scale.pack(fill=tk.X, pady=(5, 0))
+
+        ttk.Label(
+            dedupe_frame,
+            text="Lower keeps more frames. Higher removes more near-identical frames.",
+            style='Small.TLabel',
+        ).pack(anchor=tk.W, pady=(4, 0))
+
         controls_row = ttk.Frame(parent)
         controls_row.pack(fill=tk.X, pady=(0, 15))
 
@@ -788,6 +828,12 @@ class BackgroundRemoverApp:
                 foreground=ModernStyle.TEXT_SECONDARY,
             )
 
+    def _on_deduplication_threshold_change(self, _value=None):
+        """Refresh the threshold value label when the dedupe slider moves."""
+        self.deduplication_threshold_value_label.configure(
+            text=f"{self.deduplication_threshold.get():.3f}"
+        )
+
     def browse_video(self):
         """Open file dialog for input video"""
         filetypes = [
@@ -873,6 +919,7 @@ class BackgroundRemoverApp:
             child.destroy()
 
         self.frame_items = []
+        self.all_extracted_frame_items = []
         self.full_frame_count = 0
         self.current_frame_index = None
         self.frame_preview_photo = None
@@ -976,6 +1023,7 @@ class BackgroundRemoverApp:
             return
 
         self._rebuild_frame_list(frame_items)
+        self.all_extracted_frame_items = [dict(item) for item in frame_items]
 
         estimated = self.video_clip_metadata.get("estimated_frames")
         actual_count = len(self.frame_items)
@@ -1008,10 +1056,11 @@ class BackgroundRemoverApp:
         self.frame_preview_meta.configure(text="")
 
         for item in frame_items:
-            item["selected_var"] = tk.BooleanVar(value=False)
-            item["widget"] = None
-            self.frame_items.append(item)
-            self._add_frame_thumbnail(item)
+            frame_item = dict(item)
+            frame_item["selected_var"] = tk.BooleanVar(value=False)
+            frame_item["widget"] = None
+            self.frame_items.append(frame_item)
+            self._add_frame_thumbnail(frame_item)
 
         if self.frame_items:
             self.current_frame_index = self.frame_items[0]["index"]
@@ -1037,7 +1086,7 @@ class BackgroundRemoverApp:
         has_frames = bool(self.frame_items)
         has_selected_frames = has_frames and self._selected_frame_count() > 0
         self.select_all_btn.configure_state("normal" if has_frames else "disabled")
-        self.remove_duplicates_btn.configure_state("normal" if len(self.frame_items) > 1 else "disabled")
+        self.remove_duplicates_btn.configure_state("normal" if len(self.all_extracted_frame_items) > 1 else "disabled")
         self.clear_selection_btn.configure_state("normal" if has_frames else "disabled")
         self.save_frames_btn.configure_state("normal" if has_selected_frames else "disabled")
         self.remove_bg_frames_btn.configure_state("normal" if has_selected_frames else "disabled")
@@ -1045,14 +1094,14 @@ class BackgroundRemoverApp:
 
     def remove_duplicate_frames(self):
         """Start duplicate-frame removal in a background thread."""
-        if len(self.frame_items) <= 1 or self.video_processing:
+        if len(self.all_extracted_frame_items) <= 1 or self.video_processing:
             return
 
         self.video_processing = True
         self._set_video_action_states(is_busy=True)
         self.video_progress.start(10)
         self.video_status_label.configure(
-            text="Comparing frames for duplicates...",
+            text=f"Comparing frames for duplicates at threshold {self.deduplication_threshold.get():.3f}...",
             foreground=ModernStyle.TEXT_SECONDARY,
         )
 
@@ -1062,7 +1111,10 @@ class BackgroundRemoverApp:
     def _remove_duplicates_thread(self):
         """Filter visually duplicate frames without reopening the video."""
         try:
-            unique_items = dedupe_frame_items(self.frame_items)
+            unique_items = dedupe_frame_items(
+                self.all_extracted_frame_items,
+                threshold=self.deduplication_threshold.get(),
+            )
             self.root.after(0, lambda: self._finish_duplicate_removal(unique_items))
         except Exception as e:
             self.root.after(0, lambda: self._on_duplicate_removal_error(str(e)))
@@ -1077,7 +1129,10 @@ class BackgroundRemoverApp:
 
         self._rebuild_frame_list(unique_items)
         self.video_status_label.configure(
-            text=f"{self.full_frame_count} frames extracted, {len(self.frame_items)} unique frames kept.",
+            text=(
+                f"{self.full_frame_count} frames extracted, {len(self.frame_items)} unique frames kept "
+                f"at threshold {self.deduplication_threshold.get():.3f}."
+            ),
             foreground=ModernStyle.SUCCESS,
         )
 

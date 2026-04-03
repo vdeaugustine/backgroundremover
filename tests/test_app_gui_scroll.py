@@ -65,7 +65,35 @@ class FrameSidebarScrollTests(unittest.TestCase):
         ]
 
         with mock.patch.object(self.app, "_add_frame_thumbnail"), mock.patch.object(self.app, "_show_frame_preview"):
+            self.app.all_extracted_frame_items = list(frame_items)
             self.app._rebuild_frame_list(frame_items)
+
+        self.assertFalse(self.app.remove_duplicates_btn._disabled)
+
+    def test_remove_duplicates_button_stays_enabled_when_original_extracted_set_is_larger(self):
+        original_items = [
+            {
+                "index": 0,
+                "name": "Frame 1",
+                "path": __file__,
+                "size": (10, 10),
+                "thumbnail": mock.Mock(),
+                "compare_array": np.zeros((4, 4), dtype=np.float32),
+            },
+            {
+                "index": 1,
+                "name": "Frame 2",
+                "path": __file__,
+                "size": (10, 10),
+                "thumbnail": mock.Mock(),
+                "compare_array": np.ones((4, 4), dtype=np.float32),
+            },
+        ]
+        visible_items = [original_items[0]]
+
+        with mock.patch.object(self.app, "_add_frame_thumbnail"), mock.patch.object(self.app, "_show_frame_preview"):
+            self.app.all_extracted_frame_items = list(original_items)
+            self.app._rebuild_frame_list(visible_items)
 
         self.assertFalse(self.app.remove_duplicates_btn._disabled)
 
@@ -117,6 +145,19 @@ class FrameDeduplicationTests(unittest.TestCase):
         unique_items = dedupe_frame_items(items)
 
         self.assertEqual([item["index"] for item in unique_items], [0, 1, 2])
+
+    def test_lower_threshold_keeps_more_frames_than_higher_threshold(self):
+        items = [
+            self._item(0, np.zeros((4, 4))),
+            self._item(1, np.full((4, 4), 0.02)),
+            self._item(2, np.full((4, 4), 0.04)),
+        ]
+
+        lower_threshold_unique = dedupe_frame_items(items, threshold=0.01)
+        higher_threshold_unique = dedupe_frame_items(items, threshold=0.03)
+
+        self.assertEqual([item["index"] for item in lower_threshold_unique], [0, 1, 2])
+        self.assertEqual([item["index"] for item in higher_threshold_unique], [0, 2])
 
 
 class VideoExportHelperTests(unittest.TestCase):
