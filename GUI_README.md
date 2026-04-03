@@ -1,10 +1,12 @@
 # Background Remover GUI
 
-A simple and user-friendly graphical interface for removing backgrounds from images using the backgroundremover library.
+A simple and user-friendly graphical interface for removing backgrounds from images and extracting frames from videos using the backgroundremover library.
 
 ## Features
 
 - **Easy File Selection**: Browse and select input images with a simple file dialog
+- **Video Frame Extraction**: Load a video, extract every frame, preview them in a sidebar, and save only the frames you select
+- **Duplicate Frame Cleanup**: Remove near-identical frames from the review list before choosing which ones to save
 - **Multiple Model Support**: Choose between different AI models (u2net, u2netp, u2net_human_seg)
 - **Alpha Matting**: Optional high-quality background removal with alpha matting
 - **Live Preview**: See input and output images side by side
@@ -50,6 +52,16 @@ Double-click `run_gui.bat` or run it from command prompt.
    - Click "Remove Background"
    - Wait for processing to complete
    - The output preview will show the result
+
+### Video Frame Extraction
+
+1. Open the **Video Frames** tab
+2. Click the upload area or the **Upload** button and choose a video
+3. Leave the save location at **Downloads** or enable **Choose custom folder**
+4. Click **Extract Frames**
+5. Optionally click **Remove Duplicates** to keep only visually unique frames
+6. Review frames in the left sidebar and check the ones you want to keep
+7. Click **Save Selected**
 
 ## Supported File Formats
 

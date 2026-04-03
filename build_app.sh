@@ -33,7 +33,7 @@ echo ""
 # Clean previous builds
 rm -rf build dist "Background Remover.spec" 2>/dev/null || true
 
-# Use PyInstaller - simplified build without moviepy
+# Use PyInstaller - include the video stack for the frame extraction tab
 pyinstaller \
     --name "Background Remover" \
     --windowed \
@@ -63,19 +63,23 @@ pyinstaller \
     --hidden-import "pillow_heif" \
     --hidden-import "requests" \
     --hidden-import "tqdm" \
+    --hidden-import "moviepy" \
+    --hidden-import "imageio" \
+    --hidden-import "imageio_ffmpeg" \
+    --hidden-import "ffmpeg" \
     --hidden-import "numba" \
     --collect-all "torch" \
     --collect-all "torchvision" \
     --collect-all "scipy" \
     --collect-all "pymatting" \
     --collect-all "hsh" \
+    --collect-all "moviepy" \
+    --collect-all "imageio" \
+    --collect-all "imageio_ffmpeg" \
+    --collect-all "ffmpeg" \
     --collect-all "numba" \
     --collect-all "llvmlite" \
     --collect-all "pillow_heif" \
-    --exclude-module "moviepy" \
-    --exclude-module "imageio" \
-    --exclude-module "imageio_ffmpeg" \
-    --exclude-module "ffmpeg" \
     --exclude-module "matplotlib" \
     --exclude-module "PyQt5" \
     --exclude-module "PyQt6" \
