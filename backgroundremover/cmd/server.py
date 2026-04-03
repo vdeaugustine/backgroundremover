@@ -38,6 +38,7 @@ def index():
     ab = request.values.get("ab", type=int, default=10)
     ae = request.values.get("ae", type=int, default=10)
     az = request.values.get("az", type=int, default=1000)
+    mt = request.values.get("mt", type=int, default=None)
 
     model = request.args.get("model", type=str, default="u2net")
     model_path = os.environ.get(
@@ -62,6 +63,7 @@ def index():
                     alpha_matting_background_threshold=ab,
                     alpha_matting_erode_structure_size=ae,
                     alpha_matting_base_size=az,
+                    mask_threshold=mt,
                 )
             ),
             mimetype="image/png",

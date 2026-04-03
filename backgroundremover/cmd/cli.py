@@ -2,7 +2,7 @@ import argparse
 import os
 from distutils.util import strtobool
 from .. import utilities
-from ..bg import remove
+from ..bg import remove, max_workers
 
 
 def main():
@@ -72,6 +72,14 @@ def main():
     )
 
     ap.add_argument(
+        "-mt",
+        "--mask-threshold",
+        default=None,
+        type=int,
+        help="Threshold (0-255) to binarize the mask for hard/sharp edges. Useful for cartoonish images. Values around 128 work well.",
+    )
+
+    ap.add_argument(
         "-bc",
         "--background-color",
         type=str,
@@ -132,7 +140,7 @@ def main():
         "--alpha-codec",
         default="auto",
         type=str,
-        help="Codec for transparent video output (auto, prores_ks, qtrle, libvpx-vp9). Auto defaults to lossless qtrle.",
+        help="Codec for transparent video output (auto, prores_ks, qtrle, libvpx-vp9). Auto defaults to prores_ks (ProRes 4444).",
     )
     ap.add_argument(
         "--alpha-pix-fmt",
@@ -240,10 +248,11 @@ def main():
         print("Example: backgroundremover -i video.mp4 -tgwb -bi background.png -o output.gif")
         exit(1)
 
-    # Warn about high worker counts that may cause issues
-    if args.workernodes > 4:
-        print(f"Warning: Using {args.workernodes} workers. High worker counts (>4) may cause ConnectionResetError or crashes on some systems.")
-        print("If you experience errors, try reducing workers with -wn 1 or -wn 2")
+    # Dynamically cap worker count based on available GPU memory (see issue #181)
+    safe_max = max_workers(model_name=args.model, gpu_batchsize=args.gpubatchsize)
+    if args.workernodes > safe_max:
+        print(f"Warning: Requested {args.workernodes} workers, capping at {safe_max} based on available memory.")
+        args.workernodes = safe_max
 
     # Parse background color if provided
     background_color = None
@@ -348,6 +357,7 @@ def main():
                             only_mask=args.only_mask,
                             background_color=background_color,
                             background_image=background_image,
+                            mask_threshold=args.mask_threshold,
                         ),
                     )
         return

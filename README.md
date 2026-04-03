@@ -288,15 +288,15 @@ backgroundremover -i "/path/to/video.mp4" -mk -o "output.matte.mp4"
 
 ### Video Playback and Compatibility
 
-**Important:** Transparent `.mov` outputs default to the lossless `qtrle` (QuickTime RLE) codec with alpha channel. This is large but preserves transparency. You can switch codecs with `--alpha-codec` for smaller or more compatible outputs.
+**Important:** Transparent `.mov` outputs default to ProRes 4444 (`prores_ks` with `yuva444p10le`) which provides 10-bit color with alpha channel and excellent compatibility with professional video editors (DaVinci Resolve, Premiere, Final Cut Pro). You can switch codecs with `--alpha-codec` if needed.
 
 Examples:
 ```bash
-# macOS-friendly ProRes 4444 (still large, but more compatible)
-backgroundremover -i "video.mp4" -tv --alpha-codec prores_ks -o "output.mov"
-
 # Smaller WebM with alpha (if your tools support it)
 backgroundremover -i "video.mp4" -tv --alpha-codec libvpx-vp9 -o "output.webm"
+
+# Legacy qtrle codec (lossless but very large files)
+backgroundremover -i "video.mp4" -tv --alpha-codec qtrle -o "output.mov"
 ```
 
 **Recommended video players:**
@@ -307,7 +307,7 @@ backgroundremover -i "video.mp4" -tv --alpha-codec libvpx-vp9 -o "output.webm"
 **Common issues:**
 - **VLC**: May not display transparency correctly - shows distorted colors or green/purple tint
 - **Windows Media Player**: Limited transparency support
-- **Web browsers**: Limited support for qtrle codec
+- **Web browsers**: Limited support for ProRes codec
 
 **Workarounds if your player doesn't support transparency:**
 
@@ -482,11 +482,11 @@ If the output video shows distorted colors, green/purple tint, or transparency i
 
 ### Large Output File Sizes
 
-The transparent `.mov` files use uncompressed `qtrle` codec and will be significantly larger than the input. This is expected:
+The transparent `.mov` files use ProRes 4444 codec and will be larger than the input. ProRes 4444 provides much better compression than the previous qtrle codec while maintaining 10-bit color with alpha:
 
-- A 10MB input video may produce a 500MB+ output
-- This is normal for lossless transparency
-- Use post-processing to compress if needed (see conversion examples in the playback section)
+- File sizes are significantly smaller than qtrle but still larger than standard video
+- This is expected for high-quality transparency preservation
+- Use `--alpha-codec libvpx-vp9` with `.webm` output for smaller files if your tools support it
 
 ### Poor Quality or Inaccurate Results
 

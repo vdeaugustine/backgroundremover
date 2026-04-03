@@ -27,13 +27,56 @@ except ImportError:
 try:
     if torch.cuda.is_available():
         DEVICE = torch.device('cuda:0')
+        _gpu_name = torch.cuda.get_device_name(0)
+        _gpu_mem = torch.cuda.get_device_properties(0).total_memory
+        print(f"Device: CUDA ({_gpu_name}, {_gpu_mem // (1024**2)}MB VRAM)")
     elif torch.backends.mps.is_available():
         DEVICE = torch.device('mps')
+        print("Device: MPS (Apple Silicon GPU)")
     else:
         DEVICE = torch.device('cpu')
+        print("Device: CPU (no GPU detected - install CUDA toolkit for GPU acceleration)")
 except Exception as e:
-    print(f"Using CPU.  Setting Cuda or MPS failed: {e}")
+    print(f"Device: CPU (Setting CUDA or MPS failed: {e})")
     DEVICE = torch.device('cpu')
+
+
+def max_workers(model_name="u2net", gpu_batchsize=2):
+    """Estimate max safe worker processes based on available GPU/system memory.
+
+    Each worker spawns a separate process that loads its own copy of the model
+    plus a CUDA context. This estimates how many can fit in VRAM.
+    """
+    if torch.cuda.is_available():
+        try:
+            total_mem = torch.cuda.get_device_properties(0).total_memory
+        except Exception:
+            return 1
+
+        # Per-worker VRAM estimate:
+        #   CUDA context per process:  ~400MB
+        #   Model weights (float32):   ~175MB (u2net/human_seg), ~5MB (u2netp)
+        #   JIT traced copy:           same as model weights
+        #   Batch inference tensors:   ~30MB per frame in batch
+        if model_name == "u2netp":
+            model_bytes = 5 * 1024 * 1024
+        else:
+            model_bytes = 175 * 1024 * 1024
+
+        per_worker = (
+            400 * 1024 * 1024       # CUDA context overhead
+            + model_bytes * 2       # model + JIT trace
+            + gpu_batchsize * 30 * 1024 * 1024  # inference tensors
+        )
+
+        # Reserve 512MB for OS/driver/display
+        usable = total_mem - 512 * 1024 * 1024
+        calculated = max(1, int(usable // per_worker))
+        return calculated
+
+    # CPU/MPS: limit by CPU cores (inference is compute-bound)
+    cpu_count = os.cpu_count() or 2
+    return max(1, cpu_count // 2)
 
 class Net(torch.nn.Module):
     def __init__(self, model_name):
@@ -216,6 +259,7 @@ def remove(
     only_mask=False,
     background_color=None,
     background_image=None,
+    mask_threshold=None,
 ):
     model = get_model(model_name)
 
@@ -231,6 +275,10 @@ def remove(
             raise ValueError(f"Invalid image input to `remove()`: {e}")
 
     mask = detect.predict(model, np.array(img)).convert("L")
+
+    # Apply threshold for hard/sharp edges (fixes #122)
+    if mask_threshold is not None:
+        mask = mask.point(lambda p: 255 if p > mask_threshold else 0)
 
     # If only_mask is True, return just the mask
     if only_mask:

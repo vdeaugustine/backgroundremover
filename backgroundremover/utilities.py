@@ -28,7 +28,7 @@ def _alpha_encoding_args(output, alpha_codec, alpha_pix_fmt):
         if ext == ".webm":
             alpha_codec = "libvpx-vp9"
         else:
-            alpha_codec = "qtrle"
+            alpha_codec = "prores_ks"
 
     if alpha_codec == "prores_ks":
         args = ["-c:v", "prores_ks", "-profile:v", "4"]
