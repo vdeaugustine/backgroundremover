@@ -1,12 +1,15 @@
 import types
 import unittest
 from unittest import mock
+import os
+import tempfile
 
 import tkinter as tk
 import numpy as np
 from PIL import Image
 
 from app_gui import (
+    apply_color_cleanup,
     BackgroundRemoverApp,
     build_export_filename,
     crop_to_visible_bounds,
@@ -194,6 +197,69 @@ class VideoExportHelperTests(unittest.TestCase):
         cropped = crop_to_visible_bounds(image)
 
         self.assertEqual(cropped.size, (5, 7))
+
+    def test_apply_color_cleanup_removes_matching_pixels_with_threshold(self):
+        image = Image.new("RGBA", (3, 1), (0, 0, 0, 0))
+        image.putpixel((0, 0), (255, 0, 0, 255))
+        image.putpixel((1, 0), (0, 255, 0, 255))
+        image.putpixel((2, 0), (5, 245, 10, 255))
+
+        cleaned = apply_color_cleanup(image, [(0, 255, 0)], threshold=15)
+
+        self.assertEqual(cleaned.getpixel((0, 0)), (255, 0, 0, 255))
+        self.assertEqual(cleaned.getpixel((1, 0))[3], 0)
+        self.assertEqual(cleaned.getpixel((2, 0))[3], 0)
+
+
+class VideoBackgroundCleanupPipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = BackgroundRemoverApp(self.root)
+        self.root.update_idletasks()
+
+    def tearDown(self):
+        try:
+            self.app.on_close()
+        except Exception:
+            self.root.destroy()
+
+    def test_background_export_applies_selected_color_cleanup_before_save(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = os.path.join(temp_dir, "frame.png")
+            Image.new("RGB", (4, 4), (255, 255, 255)).save(source_path, "PNG")
+
+            selected_items = [{"path": source_path}]
+            cutout = Image.new("RGBA", (4, 4), (0, 0, 0, 0))
+            cutout.putpixel((0, 0), (255, 0, 0, 255))
+            cutout.putpixel((1, 0), (0, 255, 0, 255))
+            cutout.putpixel((2, 0), (4, 248, 8, 255))
+            cutout.putpixel((0, 1), (255, 0, 0, 255))
+            cutout.putpixel((1, 1), (255, 0, 0, 255))
+            cutout.putpixel((2, 1), (255, 0, 0, 255))
+
+            saved_payload = {}
+
+            with mock.patch.object(self.app, "_load_model", return_value=mock.sentinel.net), \
+                 mock.patch.object(self.app, "_create_cutout_for_image", return_value=cutout.copy()), \
+                 mock.patch.object(self.app.root, "after", side_effect=lambda _delay, callback: callback()), \
+                 mock.patch.object(self.app, "_on_background_frames_saved", side_effect=lambda paths, target_dir: saved_payload.update({"paths": paths, "target_dir": target_dir})):
+                self.app._remove_background_and_save_selected_frames_thread(
+                    selected_items=selected_items,
+                    target_dir=temp_dir,
+                    output_prefix="avatar",
+                    model_name="u2net",
+                    alpha_matting=False,
+                    cleanup_colors=[(0, 255, 0)],
+                    cleanup_threshold=15,
+                )
+
+            with Image.open(saved_payload["paths"][0]) as saved_image_file:
+                saved_image = saved_image_file.convert("RGBA")
+
+            self.assertEqual(saved_image.getpixel((0, 0)), (255, 0, 0, 255))
+            self.assertEqual(saved_image.getpixel((1, 0))[3], 0)
+            self.assertEqual(saved_image.getpixel((2, 0))[3], 0)
 
 
 if __name__ == "__main__":

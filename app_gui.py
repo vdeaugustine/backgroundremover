@@ -7,7 +7,7 @@ Optimized for Apple Silicon (M-series) with MPS acceleration.
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, colorchooser
 import os
 import sys
 import shutil
@@ -21,6 +21,9 @@ DUPLICATE_FRAME_SIGNATURE_SIZE = (24, 24)
 DUPLICATE_FRAME_MAX_MEAN_DIFFERENCE = 0.015
 DEDUPLICATION_THRESHOLD_MIN = 0.001
 DEDUPLICATION_THRESHOLD_MAX = 0.050
+COLOR_CLEANUP_THRESHOLD_MIN = 0
+COLOR_CLEANUP_THRESHOLD_MAX = 120
+COLOR_CLEANUP_THRESHOLD_DEFAULT = 15
 
 # Handle running from app bundle
 if getattr(sys, 'frozen', False):
@@ -91,6 +94,43 @@ def crop_to_visible_bounds(image):
     if bbox is None:
         return image
     return image.crop(bbox)
+
+
+def format_rgb_color(color):
+    """Format an RGB tuple as a hex color string."""
+    red, green, blue = (max(0, min(255, int(channel))) for channel in color)
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
+def apply_color_cleanup(image, cleanup_colors, threshold=0):
+    """Make pixels transparent when they match any selected cleanup color within tolerance."""
+    rgba_image = image.convert("RGBA")
+    if not cleanup_colors:
+        return rgba_image
+
+    pixel_array = np.array(rgba_image, dtype=np.uint8)
+    if pixel_array.size == 0:
+        return rgba_image
+
+    opaque_mask = pixel_array[:, :, 3] > 0
+    if not np.any(opaque_mask):
+        return rgba_image
+
+    threshold = max(0, int(threshold))
+    rgb_values = pixel_array[:, :, :3].astype(np.int16)
+    matched_mask = np.zeros(opaque_mask.shape, dtype=bool)
+
+    for color in cleanup_colors:
+        target = np.array([int(channel) for channel in color[:3]], dtype=np.int16)
+        channel_difference = np.max(np.abs(rgb_values - target), axis=2)
+        matched_mask |= channel_difference <= threshold
+
+    matched_mask &= opaque_mask
+    if not np.any(matched_mask):
+        return rgba_image
+
+    pixel_array[matched_mask, 3] = 0
+    return Image.fromarray(pixel_array)
 
 
 class ModernStyle:
@@ -222,6 +262,9 @@ class BackgroundRemoverApp:
         self.video_bg_alpha_matting = tk.BooleanVar(value=False)
         self.video_output_prefix = tk.StringVar()
         self.deduplication_threshold = tk.DoubleVar(value=DUPLICATE_FRAME_MAX_MEAN_DIFFERENCE)
+        self.video_cleanup_threshold = tk.IntVar(value=COLOR_CLEANUP_THRESHOLD_DEFAULT)
+        self.video_cleanup_colors = []
+        self.preview_color_pick_active = False
         
         # Configure styles
         self.setup_styles()
@@ -619,6 +662,85 @@ class BackgroundRemoverApp:
             style='Small.TLabel',
         ).pack(anchor=tk.W, pady=(4, 0))
 
+        cleanup_frame = ttk.Frame(parent)
+        cleanup_frame.pack(fill=tk.X, pady=(0, 15))
+
+        cleanup_header = ttk.Frame(cleanup_frame)
+        cleanup_header.pack(fill=tk.X)
+        ttk.Label(cleanup_header, text="Final Color Cleanup").pack(side=tk.LEFT)
+        self.video_cleanup_threshold_value_label = ttk.Label(
+            cleanup_header,
+            text=str(self.video_cleanup_threshold.get()),
+            style='Small.TLabel',
+        )
+        self.video_cleanup_threshold_value_label.pack(side=tk.RIGHT)
+
+        self.video_cleanup_threshold_scale = tk.Scale(
+            cleanup_frame,
+            from_=COLOR_CLEANUP_THRESHOLD_MIN,
+            to=COLOR_CLEANUP_THRESHOLD_MAX,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=self.video_cleanup_threshold,
+            command=self._on_video_cleanup_threshold_change,
+            bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            troughcolor=ModernStyle.BG_TERTIARY,
+            activebackground=ModernStyle.ACCENT,
+            highlightthickness=0,
+            font=ModernStyle.FONT_SMALL,
+        )
+        self.video_cleanup_threshold_scale.pack(fill=tk.X, pady=(5, 0))
+
+        ttk.Label(
+            cleanup_frame,
+            text="Sample leftover chroma colors from the selected-frame preview or add one manually. Matching pixels become transparent after AI removal and before save.",
+            style='Small.TLabel',
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+        cleanup_button_row = ttk.Frame(cleanup_frame)
+        cleanup_button_row.pack(fill=tk.X, pady=(10, 8))
+
+        self.pick_cleanup_color_btn = RoundedButton(
+            cleanup_button_row,
+            text="Sample From Preview",
+            command=self._toggle_preview_color_pick,
+            width=180,
+            height=38,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.pick_cleanup_color_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.add_cleanup_color_btn = RoundedButton(
+            cleanup_button_row,
+            text="Add Color...",
+            command=self._choose_video_cleanup_color,
+            width=140,
+            height=38,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.add_cleanup_color_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.clear_cleanup_colors_btn = RoundedButton(
+            cleanup_button_row,
+            text="Clear Colors",
+            command=self._clear_video_cleanup_colors,
+            width=130,
+            height=38,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.clear_cleanup_colors_btn.pack(side=tk.LEFT)
+
+        self.video_cleanup_colors_label = ttk.Label(
+            cleanup_frame,
+            text="No cleanup colors selected.",
+            style='Small.TLabel',
+        )
+        self.video_cleanup_colors_label.pack(anchor=tk.W)
+
         controls_row = ttk.Frame(parent)
         controls_row.pack(fill=tk.X, pady=(0, 15))
 
@@ -783,6 +905,7 @@ class BackgroundRemoverApp:
             font=ModernStyle.FONT_BODY,
         )
         self.frame_preview.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 10))
+        self.frame_preview.bind("<Button-1>", self._on_frame_preview_click)
 
         self.frame_preview_meta = tk.Label(
             preview_container,
@@ -794,6 +917,7 @@ class BackgroundRemoverApp:
             justify=tk.LEFT,
         )
         self.frame_preview_meta.pack(fill=tk.X, padx=14, pady=(0, 14))
+        self._refresh_video_cleanup_controls()
     
     def center_window(self):
         """Center the window on screen"""
@@ -849,7 +973,7 @@ class BackgroundRemoverApp:
         if filename:
             self.video_file.set(filename)
             self.video_output_prefix.set(os.path.splitext(os.path.basename(filename))[0])
-            self._reset_extracted_frames()
+            self._reset_extracted_frames(clear_cleanup_colors=True)
             self.video_status_label.configure(
                 text="Video selected. Click Extract Frames to build the frame list.",
                 foreground=ModernStyle.TEXT_SECONDARY,
@@ -913,7 +1037,7 @@ class BackgroundRemoverApp:
         self.frame_list_canvas.yview_scroll(step, "units")
         return "break"
 
-    def _reset_extracted_frames(self):
+    def _reset_extracted_frames(self, clear_cleanup_colors=False):
         """Clear extracted frame state and temporary files"""
         for child in self.frame_list_inner.winfo_children():
             child.destroy()
@@ -931,6 +1055,10 @@ class BackgroundRemoverApp:
         self.save_frames_btn.configure_state("disabled")
         self.remove_bg_frames_btn.configure_state("disabled")
         self.remove_bg_frames_options_btn.configure_state("disabled")
+        self.preview_color_pick_active = False
+        if clear_cleanup_colors:
+            self.video_cleanup_colors = []
+        self._refresh_video_cleanup_controls()
         self._cleanup_frame_temp_dir()
 
     def _cleanup_frame_temp_dir(self):
@@ -1054,6 +1182,8 @@ class BackgroundRemoverApp:
         self.frame_preview_photo = None
         self.frame_preview.configure(image="", text="Extract frames to start reviewing them")
         self.frame_preview_meta.configure(text="")
+        self.preview_color_pick_active = False
+        self._refresh_video_cleanup_controls()
 
         for item in frame_items:
             frame_item = dict(item)
@@ -1080,6 +1210,9 @@ class BackgroundRemoverApp:
             self.save_frames_btn.configure_state("disabled")
             self.remove_bg_frames_btn.configure_state("disabled")
             self.remove_bg_frames_options_btn.configure_state("disabled")
+            self.pick_cleanup_color_btn.configure_state("disabled")
+            self.add_cleanup_color_btn.configure_state("disabled")
+            self.clear_cleanup_colors_btn.configure_state("disabled")
             return
 
         self.extract_frames_btn.configure_state("normal")
@@ -1091,6 +1224,120 @@ class BackgroundRemoverApp:
         self.save_frames_btn.configure_state("normal" if has_selected_frames else "disabled")
         self.remove_bg_frames_btn.configure_state("normal" if has_selected_frames else "disabled")
         self.remove_bg_frames_options_btn.configure_state("normal" if has_selected_frames else "disabled")
+        self.pick_cleanup_color_btn.configure_state("normal" if self.current_frame_index is not None else "disabled")
+        self.add_cleanup_color_btn.configure_state("normal")
+        self.clear_cleanup_colors_btn.configure_state("normal" if self.video_cleanup_colors else "disabled")
+
+    def _on_video_cleanup_threshold_change(self, _value):
+        self.video_cleanup_threshold_value_label.configure(text=str(self.video_cleanup_threshold.get()))
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+        else:
+            self._refresh_video_cleanup_controls()
+
+    def _cleanup_colors_summary(self):
+        if not self.video_cleanup_colors:
+            return "None selected"
+
+        swatches = [format_rgb_color(color) for color in self.video_cleanup_colors[:4]]
+        if len(self.video_cleanup_colors) > 4:
+            swatches.append(f"+{len(self.video_cleanup_colors) - 4} more")
+        return ", ".join(swatches)
+
+    def _refresh_video_cleanup_controls(self):
+        if self.preview_color_pick_active:
+            self.pick_cleanup_color_btn.set_text("Click Preview To Sample")
+            self.frame_preview.configure(cursor="crosshair")
+        else:
+            self.pick_cleanup_color_btn.set_text("Sample From Preview")
+            self.frame_preview.configure(cursor="")
+
+        self.video_cleanup_colors_label.configure(
+            text=f"Cleanup colors: {self._cleanup_colors_summary()}. Tolerance: {self.video_cleanup_threshold.get()}"
+        )
+
+        if self.video_processing:
+            self.pick_cleanup_color_btn.configure_state("disabled")
+            self.add_cleanup_color_btn.configure_state("disabled")
+            self.clear_cleanup_colors_btn.configure_state("disabled")
+            return
+
+        self.pick_cleanup_color_btn.configure_state("normal" if self.current_frame_index is not None else "disabled")
+        self.add_cleanup_color_btn.configure_state("normal")
+        self.clear_cleanup_colors_btn.configure_state("normal" if self.video_cleanup_colors else "disabled")
+
+    def _toggle_preview_color_pick(self):
+        if self.current_frame_index is None:
+            messagebox.showerror("Error", "Select a frame preview before sampling a cleanup color.")
+            return
+
+        self.preview_color_pick_active = not self.preview_color_pick_active
+        self._refresh_video_cleanup_controls()
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+
+    def _choose_video_cleanup_color(self):
+        chosen, hex_color = colorchooser.askcolor(
+            title="Choose Cleanup Color",
+            parent=self.root,
+        )
+        if chosen is None or hex_color is None:
+            return
+
+        color = tuple(int(round(channel)) for channel in chosen[:3])
+        self._add_video_cleanup_color(color)
+
+    def _add_video_cleanup_color(self, color):
+        normalized_color = tuple(max(0, min(255, int(channel))) for channel in color[:3])
+        if normalized_color not in self.video_cleanup_colors:
+            self.video_cleanup_colors.append(normalized_color)
+
+        self.preview_color_pick_active = False
+        self._refresh_video_cleanup_controls()
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+
+    def _clear_video_cleanup_colors(self):
+        self.video_cleanup_colors = []
+        self.preview_color_pick_active = False
+        self._refresh_video_cleanup_controls()
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+
+    def _current_frame_item(self):
+        return next((item for item in self.frame_items if item["index"] == self.current_frame_index), None)
+
+    def _on_frame_preview_click(self, event):
+        if not self.preview_color_pick_active or self.current_frame_index is None or self.frame_preview_photo is None:
+            return
+
+        current_item = self._current_frame_item()
+        if current_item is None:
+            return
+
+        display_width = self.frame_preview_photo.width()
+        display_height = self.frame_preview_photo.height()
+        widget_width = max(self.frame_preview.winfo_width(), display_width)
+        widget_height = max(self.frame_preview.winfo_height(), display_height)
+        x_offset = max((widget_width - display_width) // 2, 0)
+        y_offset = max((widget_height - display_height) // 2, 0)
+
+        local_x = event.x - x_offset
+        local_y = event.y - y_offset
+        if local_x < 0 or local_y < 0 or local_x >= display_width or local_y >= display_height:
+            return
+
+        with Image.open(current_item["path"]) as opened_image:
+            source_image = opened_image.convert("RGB")
+            source_x = min(source_image.width - 1, max(0, int(local_x * source_image.width / display_width)))
+            source_y = min(source_image.height - 1, max(0, int(local_y * source_image.height / display_height)))
+            sampled_color = source_image.getpixel((source_x, source_y))
+
+        self._add_video_cleanup_color(sampled_color)
+        self.video_status_label.configure(
+            text=f"Added cleanup color {format_rgb_color(sampled_color)}. Matching pixels will be removed on the final save pass.",
+            foreground=ModernStyle.SUCCESS,
+        )
 
     def remove_duplicate_frames(self):
         """Start duplicate-frame removal in a background thread."""
@@ -1214,9 +1461,14 @@ class BackgroundRemoverApp:
             f"Resolution: {width} x {height}",
             f"Selected for saving: {'Yes' if matching['selected_var'].get() else 'No'}",
             f"Total selected: {selected_count}",
+            f"Cleanup colors: {self._cleanup_colors_summary()}",
+            f"Cleanup tolerance: {self.video_cleanup_threshold.get()}",
         ]
+        if self.preview_color_pick_active:
+            meta_lines.append("Sampling mode: click this preview to add one cleanup color.")
         self.frame_preview_meta.configure(text="\n".join(meta_lines))
         self._refresh_frame_highlight()
+        self._refresh_video_cleanup_controls()
 
     def _refresh_frame_highlight(self):
         """Refresh sidebar highlight for the current frame"""
@@ -1400,7 +1652,10 @@ class BackgroundRemoverApp:
         self.video_progress.start(10)
         self._set_video_action_states(is_busy=True)
         self.video_status_label.configure(
-            text=f"Removing backgrounds from {len(selected_items)} selected frame(s)...",
+            text=(
+                f"Removing backgrounds from {len(selected_items)} selected frame(s)"
+                f"{' with final color cleanup' if self.video_cleanup_colors else ''}..."
+            ),
             foreground=ModernStyle.TEXT_SECONDARY,
         )
 
@@ -1412,12 +1667,14 @@ class BackgroundRemoverApp:
                 output_prefix,
                 self.video_bg_model_choice.get(),
                 self.video_bg_alpha_matting.get(),
+                list(self.video_cleanup_colors),
+                self.video_cleanup_threshold.get(),
             ),
             daemon=True,
         )
         thread.start()
 
-    def _remove_background_and_save_selected_frames_thread(self, selected_items, target_dir, output_prefix, model_name, alpha_matting):
+    def _remove_background_and_save_selected_frames_thread(self, selected_items, target_dir, output_prefix, model_name, alpha_matting, cleanup_colors=None, cleanup_threshold=0):
         """Batch-remove backgrounds for selected frame images and save them as PNGs."""
         try:
             saved_paths = []
@@ -1434,6 +1691,7 @@ class BackgroundRemoverApp:
                 with Image.open(item["path"]) as opened_image:
                     img = opened_image.convert("RGB")
                 cutout = self._create_cutout_for_image(img, net, alpha_matting)
+                cutout = apply_color_cleanup(cutout, cleanup_colors or [], cleanup_threshold)
                 cutout = crop_to_visible_bounds(cutout)
                 destination = os.path.join(
                     target_dir,
