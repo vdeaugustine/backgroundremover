@@ -45,23 +45,92 @@ except Exception:
 class ModernStyle:
     """Modern macOS-inspired styling"""
     # Colors
-    BG_PRIMARY = "#1e1e1e"
-    BG_SECONDARY = "#2d2d2d"
-    BG_TERTIARY = "#3d3d3d"
-    ACCENT = "#0a84ff"
-    ACCENT_HOVER = "#409cff"
+    BG_PRIMARY = "#000000"     # Pure black for true dark mode
+    BG_SECONDARY = "#1c1c1e"   # macOS dark secondary
+    BG_TERTIARY = "#2c2c2e"    # macOS dark tertiary
+    ACCENT = "#2ecc71"         # Peter Pan Green
+    ACCENT_HOVER = "#27ae60"
     TEXT_PRIMARY = "#ffffff"
-    TEXT_SECONDARY = "#8e8e93"
-    SUCCESS = "#30d158"
+    TEXT_SECONDARY = "#a1a1a6"
+    SUCCESS = "#32d74b"
     ERROR = "#ff453a"
-    BORDER = "#48484a"
+    BORDER = "#3a3a3c"
     
-    # Fonts - use system fonts with fallbacks
-    FONT_TITLE = ("San Francisco", 24, "bold")
-    FONT_SUBTITLE = ("San Francisco", 14)
-    FONT_BODY = ("San Francisco", 13)
-    FONT_SMALL = ("San Francisco", 11)
-    FONT_BUTTON = ("San Francisco", 13, "bold")
+    # Fonts
+    FONT_TITLE = ("SF Pro Display", 28, "bold")
+    FONT_SUBTITLE = ("SF Pro Display", 15)
+    FONT_BODY = ("SF Pro Text", 13)
+    FONT_SMALL = ("SF Pro Text", 11)
+    FONT_BUTTON = ("SF Pro Text", 13, "bold")
+
+
+class RoundedButton(tk.Canvas):
+    """A custom rounded button using tk.Canvas for better macOS support"""
+    def __init__(self, parent, text, command=None, width=120, height=35, radius=10, bg=None, fg="white", hover_bg=None, font=None, **kwargs):
+        # Try to get parent's background color, fallback to ModernStyle.BG_PRIMARY
+        parent_bg = ModernStyle.BG_PRIMARY
+        try:
+            if "bg" in parent.keys():
+                parent_bg = parent["bg"]
+            elif "background" in parent.keys():
+                parent_bg = parent["background"]
+        except Exception:
+            pass
+            
+        super().__init__(parent, width=width, height=height, bg=parent_bg, highlightthickness=0, **kwargs)
+        self.command = command
+        self.radius = radius
+        self.text_str = text
+        self.bg_color = bg or ModernStyle.ACCENT
+        self.hover_bg = hover_bg or ModernStyle.ACCENT_HOVER
+        self.fg_color = fg
+        self.font = font or ModernStyle.FONT_BUTTON
+        self._disabled = False
+        
+        self.rect = self._draw_rounded_rect(0, 0, width, height, radius, fill=self.bg_color)
+        self.text = self.create_text(width/2, height/2, text=text, fill=fg, font=self.font)
+        
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def _draw_rounded_rect(self, x1, y1, x2, y2, r, **kwargs):
+        points = [x1+r, y1, x1+r, y1, x2-r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y1+r, x2, y2-r, x2, y2-r, x2, y2, x2-r, y2, x2-r, y2, x1+r, y2, x1+r, y2, x1, y2, x1, y2-r, x1, y2-r, x1, y1+r, x1, y1+r, x1, y1]
+        return self.create_polygon(points, smooth=True, **kwargs)
+
+    def _on_enter(self, event):
+        if not self._disabled:
+            self.itemconfig(self.rect, fill=self.hover_bg)
+
+    def _on_leave(self, event):
+        if not self._disabled:
+            self.itemconfig(self.rect, fill=self.bg_color)
+
+    def _on_click(self, event):
+        if not self._disabled:
+            self.move(self.rect, 1, 1)
+            self.move(self.text, 1, 1)
+
+    def _on_release(self, event):
+        if not self._disabled:
+            self.move(self.rect, -1, -1)
+            self.move(self.text, -1, -1)
+            if self.command:
+                self.command()
+
+    def configure_state(self, state):
+        if state == "disabled" or state == tk.DISABLED:
+            self._disabled = True
+            self.itemconfig(self.rect, fill=ModernStyle.BG_TERTIARY)
+            self.itemconfig(self.text, fill=ModernStyle.TEXT_SECONDARY)
+        else:
+            self._disabled = False
+            self.itemconfig(self.rect, fill=self.bg_color)
+            self.itemconfig(self.text, fill=self.fg_color)
+
+    def set_text(self, text):
+        self.itemconfig(self.text, text=text)
 
 
 class BackgroundRemoverApp:
@@ -125,7 +194,7 @@ class BackgroundRemoverApp:
                        background=ModernStyle.ACCENT,
                        troughcolor=ModernStyle.BG_TERTIARY,
                        borderwidth=0,
-                       thickness=6)
+                       thickness=10)
     
     def create_widgets(self):
         """Create the main UI"""
@@ -165,19 +234,18 @@ class BackgroundRemoverApp:
                                    fg=ModernStyle.TEXT_PRIMARY,
                                    insertbackground=ModernStyle.TEXT_PRIMARY,
                                    relief=tk.FLAT,
-                                   font=ModernStyle.FONT_BODY)
+                                   font=ModernStyle.FONT_BODY,
+                                   highlightthickness=1,
+                                   highlightbackground=ModernStyle.BORDER,
+                                   highlightcolor=ModernStyle.ACCENT)
         self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(0, 10))
         
-        browse_input_btn = tk.Button(input_entry_frame, text="Browse",
-                                    bg=ModernStyle.BG_TERTIARY,
-                                    fg=ModernStyle.TEXT_PRIMARY,
-                                    activebackground=ModernStyle.BORDER,
-                                    activeforeground=ModernStyle.TEXT_PRIMARY,
-                                    relief=tk.FLAT,
-                                    font=ModernStyle.FONT_BODY,
-                                    padx=15, pady=6,
-                                    command=self.browse_input)
-        browse_input_btn.pack(side=tk.RIGHT)
+        self.browse_input_btn = RoundedButton(input_entry_frame, text="Browse",
+                                            command=self.browse_input,
+                                            width=100, height=36,
+                                            bg=ModernStyle.BG_TERTIARY,
+                                            hover_bg=ModernStyle.BORDER)
+        self.browse_input_btn.pack(side=tk.RIGHT)
         
         # Output file
         output_frame = ttk.Frame(file_frame)
@@ -194,19 +262,18 @@ class BackgroundRemoverApp:
                                     fg=ModernStyle.TEXT_PRIMARY,
                                     insertbackground=ModernStyle.TEXT_PRIMARY,
                                     relief=tk.FLAT,
-                                    font=ModernStyle.FONT_BODY)
+                                    font=ModernStyle.FONT_BODY,
+                                    highlightthickness=1,
+                                    highlightbackground=ModernStyle.BORDER,
+                                    highlightcolor=ModernStyle.ACCENT)
         self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(0, 10))
         
-        browse_output_btn = tk.Button(output_entry_frame, text="Browse",
-                                     bg=ModernStyle.BG_TERTIARY,
-                                     fg=ModernStyle.TEXT_PRIMARY,
-                                     activebackground=ModernStyle.BORDER,
-                                     activeforeground=ModernStyle.TEXT_PRIMARY,
-                                     relief=tk.FLAT,
-                                     font=ModernStyle.FONT_BODY,
-                                     padx=15, pady=6,
-                                     command=self.browse_output)
-        browse_output_btn.pack(side=tk.RIGHT)
+        self.browse_output_btn = RoundedButton(output_entry_frame, text="Browse",
+                                             command=self.browse_output,
+                                             width=100, height=36,
+                                             bg=ModernStyle.BG_TERTIARY,
+                                             hover_bg=ModernStyle.BORDER)
+        self.browse_output_btn.pack(side=tk.RIGHT)
         
         # Options section
         options_frame = ttk.Frame(main_frame)
@@ -229,7 +296,9 @@ class BackgroundRemoverApp:
                                fg=ModernStyle.TEXT_PRIMARY,
                                selectcolor=ModernStyle.BG_TERTIARY,
                                activebackground=ModernStyle.BG_PRIMARY,
-                               activeforeground=ModernStyle.TEXT_PRIMARY,
+                               activeforeground=ModernStyle.ACCENT,
+                               indicatoron=True,
+                               padx=5,
                                font=ModernStyle.FONT_BODY)
             rb.pack(side=tk.LEFT, padx=(0, 20))
         
@@ -239,21 +308,20 @@ class BackgroundRemoverApp:
                                     fg=ModernStyle.TEXT_PRIMARY,
                                     selectcolor=ModernStyle.BG_TERTIARY,
                                     activebackground=ModernStyle.BG_PRIMARY,
-                                    activeforeground=ModernStyle.TEXT_PRIMARY,
+                                    activeforeground=ModernStyle.ACCENT,
+                                    padx=5,
                                     font=ModernStyle.FONT_BODY)
         alpha_check.pack(anchor=tk.W)
         
         # Process button
-        self.process_btn = tk.Button(main_frame, text="Remove Background",
-                                    bg=ModernStyle.ACCENT,
-                                    fg=ModernStyle.TEXT_PRIMARY,
-                                    activebackground=ModernStyle.ACCENT_HOVER,
-                                    activeforeground=ModernStyle.TEXT_PRIMARY,
-                                    relief=tk.FLAT,
-                                    font=ModernStyle.FONT_BUTTON,
-                                    padx=30, pady=12,
-                                    command=self.process_image)
-        self.process_btn.pack(pady=(0, 15))
+        self.process_btn = RoundedButton(main_frame, text="Remove Background",
+                                        command=self.process_image,
+                                        width=280, height=50,
+                                        radius=15,
+                                        bg=ModernStyle.ACCENT,
+                                        hover_bg=ModernStyle.ACCENT_HOVER,
+                                        font=ModernStyle.FONT_BUTTON)
+        self.process_btn.pack(pady=(10, 20))
         
         # Progress bar
         self.progress = ttk.Progressbar(main_frame, mode='indeterminate', style='TProgressbar')
@@ -261,7 +329,7 @@ class BackgroundRemoverApp:
         
         # Status label
         self.status_label = ttk.Label(main_frame, text="Ready", style='Small.TLabel')
-        self.status_label.pack(pady=(0, 15))
+        self.status_label.pack(pady=(0, 20))
         
         # Preview section
         preview_frame = ttk.Frame(main_frame)
@@ -325,9 +393,9 @@ class BackgroundRemoverApp:
             self.input_file.set(filename)
             self.load_input_preview(filename)
             
-            if not self.output_file.get():
-                base, ext = os.path.splitext(filename)
-                self.output_file.set(f"{base}_no_bg.png")
+            # Always update output filename when input changes
+            base, ext = os.path.splitext(filename)
+            self.output_file.set(f"{base}_no_bg.png")
     
     def browse_output(self):
         """Open file dialog for output location"""
@@ -386,7 +454,7 @@ class BackgroundRemoverApp:
             return
         
         self.processing = True
-        self.process_btn.configure(state="disabled", bg=ModernStyle.BG_TERTIARY)
+        self.process_btn.configure_state("disabled")
         self.progress.start(10)
         self.status_label.configure(text="Processing... Please wait.")
         
@@ -559,8 +627,8 @@ class BackgroundRemoverApp:
         """Called on successful processing"""
         self.processing = False
         self.progress.stop()
-        self.process_btn.configure(state="normal", bg=ModernStyle.ACCENT)
-        self.status_label.configure(text="✓ Background removed successfully!")
+        self.process_btn.configure_state("normal")
+        self.status_label.configure(text="✓ Background removed successfully!", foreground=ModernStyle.SUCCESS)
         
         self.load_output_preview(self.output_file.get())
         
@@ -570,8 +638,8 @@ class BackgroundRemoverApp:
         """Called on processing error"""
         self.processing = False
         self.progress.stop()
-        self.process_btn.configure(state="normal", bg=ModernStyle.ACCENT)
-        self.status_label.configure(text="✗ Processing failed")
+        self.process_btn.configure_state("normal")
+        self.status_label.configure(text="✗ Processing failed", foreground=ModernStyle.ERROR)
         
         messagebox.showerror("Error", f"Failed to process image:\n\n{error_msg}")
 

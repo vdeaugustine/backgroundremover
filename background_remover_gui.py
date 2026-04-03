@@ -125,11 +125,10 @@ class BackgroundRemoverGUI:
             self.input_file.set(filename)
             self.load_input_preview(filename)
             
-            # Auto-generate output filename
-            if not self.output_file.get():
-                base_name = os.path.splitext(filename)[0]
-                output_name = f"{base_name}_no_bg.png"
-                self.output_file.set(output_name)
+            # Always update output filename when input changes
+            base_name = os.path.splitext(filename)[0]
+            output_name = f"{base_name}_no_bg.png"
+            self.output_file.set(output_name)
     
     def browse_output_file(self):
         """Browse for output file location"""
