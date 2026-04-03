@@ -7,6 +7,8 @@ A simple and user-friendly graphical interface for removing backgrounds from ima
 - **Easy File Selection**: Browse and select input images with a simple file dialog
 - **Video Frame Extraction**: Load a video, extract every frame, preview them in a sidebar, and save only the frames you select
 - **Duplicate Frame Cleanup**: Remove near-identical frames from the review list before choosing which ones to save
+- **Batch Background Removal**: Run background removal on the selected frames and save them in one step
+- **Custom Export Prefixes**: Name saved outputs with your own prefix such as `dog_1`, `dog_2`, and so on
 - **Multiple Model Support**: Choose between different AI models (u2net, u2netp, u2net_human_seg)
 - **Alpha Matting**: Optional high-quality background removal with alpha matting
 - **Live Preview**: See input and output images side by side
@@ -58,10 +60,12 @@ Double-click `run_gui.bat` or run it from command prompt.
 1. Open the **Video Frames** tab
 2. Click the upload area or the **Upload** button and choose a video
 3. Leave the save location at **Downloads** or enable **Choose custom folder**
-4. Click **Extract Frames**
-5. Optionally click **Remove Duplicates** to keep only visually unique frames
-6. Review frames in the left sidebar and check the ones you want to keep
-7. Click **Save Selected**
+4. Enter an **Output Name Prefix** if you want names like `dog_1.png`, `dog_2.png`, etc.
+5. Click **Extract Frames**
+6. Optionally click **Remove Duplicates** to keep only visually unique frames
+7. Review frames in the left sidebar and check the ones you want to keep
+8. Click **Save Selected** to export the original frames, or **Remove Background + Save** to export tightly cropped transparent PNG cutouts
+9. Use the attached disclosure button if you want to adjust the AI model or alpha-matting settings before batch removal
 
 ## Supported File Formats
 

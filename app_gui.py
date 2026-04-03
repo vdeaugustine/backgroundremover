@@ -70,6 +70,27 @@ def dedupe_frame_items(frame_items, threshold=DUPLICATE_FRAME_MAX_MEAN_DIFFERENC
     return unique_items
 
 
+def resolve_output_prefix(prefix, fallback_name):
+    """Resolve a user-provided output prefix with a simple safe fallback."""
+    cleaned = (prefix or "").strip()
+    if not cleaned:
+        cleaned = fallback_name or "video"
+    return cleaned.replace(os.sep, "_")
+
+
+def build_export_filename(prefix, sequence_number, suffix=""):
+    """Build sequential export filenames for frame batch operations."""
+    return f"{prefix}_{sequence_number}{suffix}.png"
+
+
+def crop_to_visible_bounds(image):
+    """Crop transparent outer bounds from an RGBA image, if any visible pixels exist."""
+    bbox = image.getbbox()
+    if bbox is None:
+        return image
+    return image.crop(bbox)
+
+
 class ModernStyle:
     """Modern macOS-inspired styling"""
     # Colors
@@ -194,6 +215,9 @@ class BackgroundRemoverApp:
         self.frame_temp_dir = None
         self.video_clip_metadata = {}
         self.full_frame_count = 0
+        self.video_bg_model_choice = tk.StringVar(value="u2net")
+        self.video_bg_alpha_matting = tk.BooleanVar(value=False)
+        self.video_output_prefix = tk.StringVar()
         
         # Configure styles
         self.setup_styles()
@@ -536,6 +560,25 @@ class BackgroundRemoverApp:
         self.browse_frame_output_btn.pack(side=tk.RIGHT)
         self.browse_frame_output_btn.configure_state("disabled")
 
+        prefix_frame = ttk.Frame(parent)
+        prefix_frame.pack(fill=tk.X, pady=(0, 15))
+
+        ttk.Label(prefix_frame, text="Output Name Prefix").pack(anchor=tk.W)
+
+        self.video_output_prefix_entry = tk.Entry(
+            prefix_frame,
+            textvariable=self.video_output_prefix,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            insertbackground=ModernStyle.TEXT_PRIMARY,
+            relief=tk.FLAT,
+            font=ModernStyle.FONT_BODY,
+            highlightthickness=1,
+            highlightbackground=ModernStyle.BORDER,
+            highlightcolor=ModernStyle.ACCENT,
+        )
+        self.video_output_prefix_entry.pack(fill=tk.X, pady=(5, 0), ipady=8)
+
         controls_row = ttk.Frame(parent)
         controls_row.pack(fill=tk.X, pady=(0, 15))
 
@@ -595,8 +638,32 @@ class BackgroundRemoverApp:
             bg=ModernStyle.BG_TERTIARY,
             hover_bg=ModernStyle.BORDER,
         )
-        self.save_frames_btn.pack(side=tk.LEFT)
+        self.save_frames_btn.pack(side=tk.LEFT, padx=(0, 12))
         self.save_frames_btn.configure_state("disabled")
+
+        self.remove_bg_frames_btn = RoundedButton(
+            controls_row,
+            text="Remove Background + Save",
+            command=self.remove_background_and_save_selected_frames,
+            width=230,
+            height=42,
+            bg=ModernStyle.ACCENT,
+            hover_bg=ModernStyle.ACCENT_HOVER,
+        )
+        self.remove_bg_frames_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.remove_bg_frames_btn.configure_state("disabled")
+
+        self.remove_bg_frames_options_btn = RoundedButton(
+            controls_row,
+            text="v",
+            command=self.open_video_background_options,
+            width=42,
+            height=42,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.remove_bg_frames_options_btn.pack(side=tk.LEFT)
+        self.remove_bg_frames_options_btn.configure_state("disabled")
 
         self.video_progress = ttk.Progressbar(parent, mode='indeterminate', style='TProgressbar')
         self.video_progress.pack(fill=tk.X, pady=(0, 5))
@@ -735,6 +802,7 @@ class BackgroundRemoverApp:
 
         if filename:
             self.video_file.set(filename)
+            self.video_output_prefix.set(os.path.splitext(os.path.basename(filename))[0])
             self._reset_extracted_frames()
             self.video_status_label.configure(
                 text="Video selected. Click Extract Frames to build the frame list.",
@@ -814,6 +882,8 @@ class BackgroundRemoverApp:
         self.remove_duplicates_btn.configure_state("disabled")
         self.clear_selection_btn.configure_state("disabled")
         self.save_frames_btn.configure_state("disabled")
+        self.remove_bg_frames_btn.configure_state("disabled")
+        self.remove_bg_frames_options_btn.configure_state("disabled")
         self._cleanup_frame_temp_dir()
 
     def _cleanup_frame_temp_dir(self):
@@ -959,16 +1029,19 @@ class BackgroundRemoverApp:
             self.remove_duplicates_btn.configure_state("disabled")
             self.clear_selection_btn.configure_state("disabled")
             self.save_frames_btn.configure_state("disabled")
+            self.remove_bg_frames_btn.configure_state("disabled")
+            self.remove_bg_frames_options_btn.configure_state("disabled")
             return
 
         self.extract_frames_btn.configure_state("normal")
         has_frames = bool(self.frame_items)
+        has_selected_frames = has_frames and self._selected_frame_count() > 0
         self.select_all_btn.configure_state("normal" if has_frames else "disabled")
         self.remove_duplicates_btn.configure_state("normal" if len(self.frame_items) > 1 else "disabled")
         self.clear_selection_btn.configure_state("normal" if has_frames else "disabled")
-        self.save_frames_btn.configure_state(
-            "normal" if has_frames and self._selected_frame_count() > 0 else "disabled"
-        )
+        self.save_frames_btn.configure_state("normal" if has_selected_frames else "disabled")
+        self.remove_bg_frames_btn.configure_state("normal" if has_selected_frames else "disabled")
+        self.remove_bg_frames_options_btn.configure_state("normal" if has_selected_frames else "disabled")
 
     def remove_duplicate_frames(self):
         """Start duplicate-frame removal in a background thread."""
@@ -1154,14 +1227,181 @@ class BackgroundRemoverApp:
         )
         thread.start()
 
+    def open_video_background_options(self):
+        """Open a small dialog for batch background-removal settings."""
+        if not self.frame_items or self.video_processing:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Background Removal Settings")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.configure(bg=ModernStyle.BG_PRIMARY)
+
+        model_var = tk.StringVar(value=self.video_bg_model_choice.get())
+        alpha_var = tk.BooleanVar(value=self.video_bg_alpha_matting.get())
+
+        container = ttk.Frame(dialog, padding="20")
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(container, text="Batch Background Removal", style='Title.TLabel').pack(anchor=tk.W, pady=(0, 10))
+        ttk.Label(
+            container,
+            text="Choose how selected frames should be processed before saving.",
+            style='Subtitle.TLabel',
+        ).pack(anchor=tk.W, pady=(0, 16))
+
+        ttk.Label(container, text="AI Model").pack(anchor=tk.W)
+        model_frame = ttk.Frame(container)
+        model_frame.pack(fill=tk.X, pady=(8, 15))
+
+        for value, text in (
+            ("u2net", "General (Recommended)"),
+            ("u2netp", "Fast"),
+            ("u2net_human_seg", "People & Portraits"),
+        ):
+            tk.Radiobutton(
+                model_frame,
+                text=text,
+                variable=model_var,
+                value=value,
+                bg=ModernStyle.BG_PRIMARY,
+                fg=ModernStyle.TEXT_PRIMARY,
+                selectcolor=ModernStyle.BG_TERTIARY,
+                activebackground=ModernStyle.BG_PRIMARY,
+                activeforeground=ModernStyle.ACCENT,
+                font=ModernStyle.FONT_BODY,
+                padx=5,
+            ).pack(anchor=tk.W)
+
+        tk.Checkbutton(
+            container,
+            text="Enable Alpha Matting (higher quality edges)",
+            variable=alpha_var,
+            bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            selectcolor=ModernStyle.BG_TERTIARY,
+            activebackground=ModernStyle.BG_PRIMARY,
+            activeforeground=ModernStyle.ACCENT,
+            font=ModernStyle.FONT_BODY,
+            padx=5,
+        ).pack(anchor=tk.W, pady=(0, 20))
+
+        button_row = ttk.Frame(container)
+        button_row.pack(fill=tk.X)
+
+        def start_with_settings():
+            self.video_bg_model_choice.set(model_var.get())
+            self.video_bg_alpha_matting.set(alpha_var.get())
+            dialog.destroy()
+            self.remove_background_and_save_selected_frames()
+
+        RoundedButton(
+            button_row,
+            text="Cancel",
+            command=dialog.destroy,
+            width=120,
+            height=38,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        ).pack(side=tk.RIGHT)
+
+        RoundedButton(
+            button_row,
+            text="Apply + Run",
+            command=start_with_settings,
+            width=150,
+            height=38,
+            bg=ModernStyle.ACCENT,
+            hover_bg=ModernStyle.ACCENT_HOVER,
+        ).pack(side=tk.RIGHT, padx=(0, 10))
+
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - (dialog.winfo_width() // 2)
+        y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{x}+{y}")
+        dialog.grab_set()
+        dialog.focus_set()
+
+    def remove_background_and_save_selected_frames(self):
+        """Apply background removal to selected frames and save the results."""
+        if not self.frame_items:
+            messagebox.showerror("Error", "Extract frames before trying to save them.")
+            return
+
+        selected_items = [item for item in self.frame_items if item["selected_var"].get()]
+        if not selected_items:
+            messagebox.showerror("Error", "Select at least one frame to process.")
+            return
+
+        if self.video_processing:
+            return
+
+        target_dir = self.frame_output_dir.get() or os.path.join(os.path.expanduser("~"), "Downloads")
+        os.makedirs(target_dir, exist_ok=True)
+        output_prefix = self._resolved_video_output_prefix()
+
+        self.video_processing = True
+        self.video_progress.start(10)
+        self._set_video_action_states(is_busy=True)
+        self.video_status_label.configure(
+            text=f"Removing backgrounds from {len(selected_items)} selected frame(s)...",
+            foreground=ModernStyle.TEXT_SECONDARY,
+        )
+
+        thread = threading.Thread(
+            target=self._remove_background_and_save_selected_frames_thread,
+            args=(
+                selected_items,
+                target_dir,
+                output_prefix,
+                self.video_bg_model_choice.get(),
+                self.video_bg_alpha_matting.get(),
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def _remove_background_and_save_selected_frames_thread(self, selected_items, target_dir, output_prefix, model_name, alpha_matting):
+        """Batch-remove backgrounds for selected frame images and save them as PNGs."""
+        try:
+            saved_paths = []
+            net = self._load_model(model_name)
+
+            for position, item in enumerate(selected_items, start=1):
+                self.root.after(
+                    0,
+                    lambda current=position, total=len(selected_items): self.video_status_label.configure(
+                        text=f"Removing backgrounds... {current}/{total}",
+                        foreground=ModernStyle.TEXT_SECONDARY,
+                    ),
+                )
+                with Image.open(item["path"]) as opened_image:
+                    img = opened_image.convert("RGB")
+                cutout = self._create_cutout_for_image(img, net, alpha_matting)
+                cutout = crop_to_visible_bounds(cutout)
+                destination = os.path.join(
+                    target_dir,
+                    build_export_filename(output_prefix, position, suffix="_no_bg"),
+                )
+                cutout.save(destination, "PNG")
+                saved_paths.append(destination)
+
+            self.root.after(0, lambda: self._on_background_frames_saved(saved_paths, target_dir))
+        except Exception as e:
+            self.root.after(0, lambda: self._on_background_frames_save_error(str(e)))
+
     def _save_selected_frames_thread(self, selected_items, target_dir):
         """Copy selected frame PNGs to the final output folder"""
         try:
-            video_name = os.path.splitext(os.path.basename(self.video_file.get()))[0] or "video"
             saved_paths = []
+            output_prefix = self._resolved_video_output_prefix()
 
-            for item in selected_items:
-                destination = os.path.join(target_dir, f"{video_name}_{item['index'] + 1:06d}.png")
+            for position, item in enumerate(selected_items, start=1):
+                destination = os.path.join(
+                    target_dir,
+                    build_export_filename(output_prefix, position),
+                )
                 shutil.copy2(item["path"], destination)
                 saved_paths.append(destination)
 
@@ -1190,6 +1430,31 @@ class BackgroundRemoverApp:
             foreground=ModernStyle.ERROR,
         )
         messagebox.showerror("Error", f"Failed to save selected frames:\n\n{error_msg}")
+
+    def _on_background_frames_saved(self, saved_paths, target_dir):
+        """Handle successful batch background removal for selected frames."""
+        self.video_processing = False
+        self.video_progress.stop()
+        self._set_video_action_states(is_busy=False)
+        self.video_status_label.configure(
+            text=f"Backgrounds removed and saved for {len(saved_paths)} frame(s) to {target_dir}",
+            foreground=ModernStyle.SUCCESS,
+        )
+        messagebox.showinfo(
+            "Success",
+            f"Background removed and saved for {len(saved_paths)} frame(s) to:\n\n{target_dir}",
+        )
+
+    def _on_background_frames_save_error(self, error_msg):
+        """Handle batch background-removal failure for selected frames."""
+        self.video_processing = False
+        self.video_progress.stop()
+        self._set_video_action_states(is_busy=False)
+        self.video_status_label.configure(
+            text="Batch background removal failed.",
+            foreground=ModernStyle.ERROR,
+        )
+        messagebox.showerror("Error", f"Failed to remove backgrounds from selected frames:\n\n{error_msg}")
     
     def browse_input(self):
         """Open file dialog for input image"""
@@ -1405,6 +1670,18 @@ class BackgroundRemoverApp:
         empty = Image.new("RGBA", img.size, 0)
         cutout = Image.composite(img, empty, mask.resize(img.size, Image.Resampling.LANCZOS))
         return cutout
+
+    def _create_cutout_for_image(self, img, net, alpha_matting):
+        """Run the existing background-removal pipeline for one PIL image."""
+        mask = self._predict(net, np.array(img))
+        if alpha_matting:
+            return self._alpha_matting_cutout(img, mask)
+        return self._naive_cutout(img, mask)
+
+    def _resolved_video_output_prefix(self):
+        """Resolve the current video export prefix with a fallback to the video basename."""
+        fallback_name = os.path.splitext(os.path.basename(self.video_file.get()))[0] or "video"
+        return resolve_output_prefix(self.video_output_prefix.get(), fallback_name)
     
     def _process_thread(self):
         """Background processing thread"""
@@ -1421,14 +1698,7 @@ class BackgroundRemoverApp:
             # Load model
             net = self._load_model(self.model_choice.get())
             
-            # Get mask
-            mask = self._predict(net, np.array(img))
-            
-            # Apply cutout
-            if self.alpha_matting.get():
-                cutout = self._alpha_matting_cutout(img, mask)
-            else:
-                cutout = self._naive_cutout(img, mask)
+            cutout = self._create_cutout_for_image(img, net, self.alpha_matting.get())
             
             # Save
             cutout.save(self.output_file.get(), "PNG")

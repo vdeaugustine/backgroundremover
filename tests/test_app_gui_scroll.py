@@ -4,8 +4,15 @@ from unittest import mock
 
 import tkinter as tk
 import numpy as np
+from PIL import Image
 
-from app_gui import BackgroundRemoverApp, dedupe_frame_items
+from app_gui import (
+    BackgroundRemoverApp,
+    build_export_filename,
+    crop_to_visible_bounds,
+    dedupe_frame_items,
+    resolve_output_prefix,
+)
 
 
 class FrameSidebarScrollTests(unittest.TestCase):
@@ -62,6 +69,13 @@ class FrameSidebarScrollTests(unittest.TestCase):
 
         self.assertFalse(self.app.remove_duplicates_btn._disabled)
 
+    def test_browse_video_populates_output_prefix_from_filename(self):
+        with mock.patch("app_gui.filedialog.askopenfilename", return_value="/tmp/dog-run.mp4"):
+            with mock.patch.object(self.app, "_reset_extracted_frames"):
+                self.app.browse_video()
+
+        self.assertEqual(self.app.video_output_prefix.get(), "dog-run")
+
 
 class FrameDeduplicationTests(unittest.TestCase):
     def _item(self, index, compare_array):
@@ -103,6 +117,42 @@ class FrameDeduplicationTests(unittest.TestCase):
         unique_items = dedupe_frame_items(items)
 
         self.assertEqual([item["index"] for item in unique_items], [0, 1, 2])
+
+
+class VideoExportHelperTests(unittest.TestCase):
+    def test_resolve_output_prefix_uses_custom_prefix(self):
+        self.assertEqual(resolve_output_prefix(" dog ", "video"), "dog")
+
+    def test_resolve_output_prefix_falls_back_to_video_name(self):
+        self.assertEqual(resolve_output_prefix("", "dog-video"), "dog-video")
+
+    def test_build_export_filename_uses_sequential_numbering(self):
+        self.assertEqual(build_export_filename("dog", 1), "dog_1.png")
+        self.assertEqual(build_export_filename("dog", 2, suffix="_no_bg"), "dog_2_no_bg.png")
+
+    def test_crop_to_visible_bounds_removes_transparent_border(self):
+        image = Image.new("RGBA", (10, 8), (0, 0, 0, 0))
+        for x in range(3, 7):
+            for y in range(2, 6):
+                image.putpixel((x, y), (255, 0, 0, 255))
+
+        cropped = crop_to_visible_bounds(image)
+
+        self.assertEqual(cropped.size, (4, 4))
+
+    def test_crop_to_visible_bounds_leaves_tight_image_unchanged(self):
+        image = Image.new("RGBA", (4, 4), (255, 0, 0, 255))
+
+        cropped = crop_to_visible_bounds(image)
+
+        self.assertEqual(cropped.size, (4, 4))
+
+    def test_crop_to_visible_bounds_keeps_fully_transparent_image(self):
+        image = Image.new("RGBA", (5, 7), (0, 0, 0, 0))
+
+        cropped = crop_to_visible_bounds(image)
+
+        self.assertEqual(cropped.size, (5, 7))
 
 
 if __name__ == "__main__":
