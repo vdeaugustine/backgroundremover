@@ -16,6 +16,7 @@ import tempfile
 from PIL import Image, ImageTk
 import threading
 import io
+import subprocess
 import numpy as np
 from backgroundremover import bg
 
@@ -28,6 +29,15 @@ COLOR_CLEANUP_THRESHOLD_MAX = 120
 COLOR_CLEANUP_THRESHOLD_DEFAULT = 15
 MAX_COLOR_CLEANUP_WORKERS = 4
 MAX_PENDING_COLOR_CLEANUP_TASKS_PER_WORKER = 2
+
+PREVIEW_BASE_WIDTH = 250
+PREVIEW_BASE_HEIGHT = 200
+PREVIEW_ZOOM_MIN = 0.25
+PREVIEW_ZOOM_MAX = 4.0
+PREVIEW_ZOOM_STEP = 1.15
+PREVIEW_MAX_DISPLAY_SIDE = 1800
+COLOR_SWATCH_SIZE = 18
+COLOR_SWATCH_MAX_VISIBLE = 12
 
 # Handle running from app bundle
 if getattr(sys, 'frozen', False):
@@ -104,6 +114,12 @@ def format_rgb_color(color):
     """Format an RGB tuple as a hex color string."""
     red, green, blue = (max(0, min(255, int(channel))) for channel in color)
     return f"#{red:02X}{green:02X}{blue:02X}"
+
+
+def tk_rgb_from_color_tuple(color):
+    """Tk color string from an RGB tuple (handles luminance for near-white swatch borders)."""
+    red, green, blue = (max(0, min(255, int(channel))) for channel in color[:3])
+    return f"#{red:02x}{green:02x}{blue:02x}"
 
 
 def apply_color_cleanup(image, cleanup_colors, threshold=0):
@@ -287,8 +303,20 @@ class BackgroundRemoverApp:
         self.video_cleanup_colors = []
         self.preview_color_pick_active = False
         self.image_cleanup_colors = []
-        self.image_preview_color_pick_active = False
-        
+        self.image_color_pick_mode = "off"
+        self.input_preview_zoom = tk.DoubleVar(value=1.0)
+        self.output_preview_zoom = tk.DoubleVar(value=1.0)
+        self.last_saved_output_hint = tk.StringVar(value="")
+        self.input_preview_image_id = None
+        self.output_preview_image_id = None
+        self._input_preview_canvas_size = (0, 0)
+        self._output_preview_canvas_size = (0, 0)
+        self._input_preview_draw = None
+        self._output_preview_draw = None
+        self._input_source_size = None
+        self._output_source_size = None
+        self.output_preview_display_path = None
+
         # Configure styles
         self.setup_styles()
         
@@ -441,6 +469,55 @@ class BackgroundRemoverApp:
                                              hover_bg=ModernStyle.BORDER)
         self.browse_output_btn.pack(side=tk.RIGHT)
 
+        output_actions = ttk.Frame(output_frame)
+        output_actions.pack(fill=tk.X, pady=(8, 0))
+
+        self.use_output_as_input_btn = RoundedButton(
+            output_actions,
+            text="Use output as input",
+            command=self.use_output_as_input,
+            width=160,
+            height=34,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.use_output_as_input_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.save_output_copy_btn = RoundedButton(
+            output_actions,
+            text="Save output as…",
+            command=self.save_output_as_copy,
+            width=150,
+            height=34,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.save_output_copy_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.reveal_output_btn = RoundedButton(
+            output_actions,
+            text="Reveal in Finder",
+            command=self.reveal_output_in_finder,
+            width=150,
+            height=34,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        if sys.platform == "darwin":
+            self.reveal_output_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(
+            output_frame,
+            textvariable=self.last_saved_output_hint,
+            style="Small.TLabel",
+        ).pack(anchor=tk.W, pady=(6, 0))
+
+        ttk.Label(
+            output_frame,
+            text="Remove Background writes to the Output File path above. Use Save output as… to copy elsewhere.",
+            style="Small.TLabel",
+        ).pack(anchor=tk.W, pady=(2, 0))
+
         sprite_output_frame = ttk.Frame(file_frame)
         sprite_output_frame.pack(fill=tk.X, pady=(10, 0))
 
@@ -555,7 +632,7 @@ class BackgroundRemoverApp:
 
         ttk.Label(
             image_cleanup_frame,
-            text="Sample leftover background colors from the input preview or add one manually. Matching pixels become transparent before save.",
+            text="Cycle Sample to pick from input or output preview (when output exists), or add a color manually. Matching pixels become transparent on save.",
             style='Small.TLabel',
         ).pack(anchor=tk.W, pady=(4, 0))
 
@@ -564,7 +641,7 @@ class BackgroundRemoverApp:
 
         self.pick_image_cleanup_color_btn = RoundedButton(
             image_cleanup_button_row,
-            text="Sample From Input",
+            text="Sample: off (click to cycle)",
             command=self._toggle_image_preview_color_pick,
             width=180,
             height=38,
@@ -595,22 +672,50 @@ class BackgroundRemoverApp:
         )
         self.clear_image_cleanup_colors_btn.pack(side=tk.LEFT)
 
+        image_cleanup_summary_row = ttk.Frame(image_cleanup_frame)
+        image_cleanup_summary_row.pack(fill=tk.X, pady=(6, 0))
+
+        self.image_cleanup_swatches_frame = tk.Frame(
+            image_cleanup_summary_row,
+            bg=ModernStyle.BG_PRIMARY,
+        )
+        self.image_cleanup_swatches_frame.pack(side=tk.LEFT)
+
         self.image_cleanup_colors_label = ttk.Label(
-            image_cleanup_frame,
+            image_cleanup_summary_row,
             text="No cleanup colors selected.",
             style='Small.TLabel',
         )
-        self.image_cleanup_colors_label.pack(anchor=tk.W)
-        
-        # Process button
-        self.process_btn = RoundedButton(parent, text="Remove Background",
-                                        command=self.process_image,
-                                        width=280, height=50,
-                                        radius=15,
-                                        bg=ModernStyle.ACCENT,
-                                        hover_bg=ModernStyle.ACCENT_HOVER,
-                                        font=ModernStyle.FONT_BUTTON)
-        self.process_btn.pack(pady=(10, 20))
+        self.image_cleanup_colors_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        process_row = ttk.Frame(parent)
+        process_row.pack(pady=(10, 10))
+
+        self.process_btn = RoundedButton(
+            process_row,
+            text="Remove Background",
+            command=self.process_image,
+            width=280,
+            height=50,
+            radius=15,
+            bg=ModernStyle.ACCENT,
+            hover_bg=ModernStyle.ACCENT_HOVER,
+            font=ModernStyle.FONT_BUTTON,
+        )
+        self.process_btn.pack(side=tk.LEFT, padx=(0, 12))
+
+        self.apply_cleanup_save_btn = RoundedButton(
+            process_row,
+            text="Apply cleanup & save",
+            command=self.apply_cleanup_and_save,
+            width=220,
+            height=50,
+            radius=15,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+            font=ModernStyle.FONT_BUTTON,
+        )
+        self.apply_cleanup_save_btn.pack(side=tk.LEFT)
 
         self.sprite_process_btn = RoundedButton(
             parent,
@@ -633,41 +738,154 @@ class BackgroundRemoverApp:
         self.status_label = ttk.Label(parent, text="Ready", style='Small.TLabel')
         self.status_label.pack(pady=(0, 20))
         
-        # Preview section
+        # Preview section (zoomable canvases)
         preview_frame = ttk.Frame(parent)
         preview_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Input preview
+
         input_preview_frame = tk.Frame(preview_frame, bg=ModernStyle.BG_SECONDARY)
         input_preview_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        
-        tk.Label(input_preview_frame, text="Input", 
-                bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY,
-                font=ModernStyle.FONT_SMALL).pack(pady=(10, 5))
-        
-        self.input_preview = tk.Label(input_preview_frame, 
-                                     text="No image selected",
-                                     bg=ModernStyle.BG_TERTIARY,
-                                     fg=ModernStyle.TEXT_SECONDARY,
-                                     font=ModernStyle.FONT_SMALL)
-        self.input_preview.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        self.input_preview.bind("<Button-1>", self._on_input_preview_click)
-        
-        # Output preview
+
+        tk.Label(
+            input_preview_frame,
+            text="Input",
+            bg=ModernStyle.BG_SECONDARY,
+            fg=ModernStyle.TEXT_SECONDARY,
+            font=ModernStyle.FONT_SMALL,
+        ).pack(pady=(10, 5))
+
+        input_zoom_bar = tk.Frame(input_preview_frame, bg=ModernStyle.BG_SECONDARY)
+        input_zoom_bar.pack(fill=tk.X, padx=10, pady=(0, 4))
+        tk.Label(
+            input_zoom_bar,
+            text="Zoom",
+            bg=ModernStyle.BG_SECONDARY,
+            fg=ModernStyle.TEXT_SECONDARY,
+            font=ModernStyle.FONT_SMALL,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        self.input_zoom_value_label = tk.Label(
+            input_zoom_bar,
+            text="100%",
+            bg=ModernStyle.BG_SECONDARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            font=ModernStyle.FONT_SMALL,
+        )
+        self.input_zoom_value_label.pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            input_zoom_bar,
+            text="−",
+            command=lambda: self._adjust_input_preview_zoom(1.0 / PREVIEW_ZOOM_STEP),
+            width=3,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            relief=tk.FLAT,
+            highlightthickness=0,
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            input_zoom_bar,
+            text="100%",
+            command=self._reset_input_preview_zoom,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            relief=tk.FLAT,
+            highlightthickness=0,
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            input_zoom_bar,
+            text="+",
+            command=lambda: self._adjust_input_preview_zoom(PREVIEW_ZOOM_STEP),
+            width=3,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            relief=tk.FLAT,
+            highlightthickness=0,
+        ).pack(side=tk.LEFT, padx=2)
+
+        self.input_preview_canvas = tk.Canvas(
+            input_preview_frame,
+            bg=ModernStyle.BG_TERTIARY,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.input_preview_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.input_preview_canvas.bind("<Button-1>", self._on_input_preview_canvas_click)
+        self.input_preview_canvas.bind("<MouseWheel>", self._on_input_preview_mousewheel)
+        self.input_preview_canvas.bind("<Button-4>", self._on_input_preview_mousewheel)
+        self.input_preview_canvas.bind("<Button-5>", self._on_input_preview_mousewheel)
+        self.input_preview_canvas.bind("<Configure>", self._on_input_preview_canvas_configure)
+
         output_preview_frame = tk.Frame(preview_frame, bg=ModernStyle.BG_SECONDARY)
         output_preview_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
-        
-        tk.Label(output_preview_frame, text="Output",
-                bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY,
-                font=ModernStyle.FONT_SMALL).pack(pady=(10, 5))
-        
-        self.output_preview = tk.Label(output_preview_frame,
-                                      text="No output yet",
-                                      bg=ModernStyle.BG_TERTIARY,
-                                      fg=ModernStyle.TEXT_SECONDARY,
-                                      font=ModernStyle.FONT_SMALL)
-        self.output_preview.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        tk.Label(
+            output_preview_frame,
+            text="Output",
+            bg=ModernStyle.BG_SECONDARY,
+            fg=ModernStyle.TEXT_SECONDARY,
+            font=ModernStyle.FONT_SMALL,
+        ).pack(pady=(10, 5))
+
+        output_zoom_bar = tk.Frame(output_preview_frame, bg=ModernStyle.BG_SECONDARY)
+        output_zoom_bar.pack(fill=tk.X, padx=10, pady=(0, 4))
+        tk.Label(
+            output_zoom_bar,
+            text="Zoom",
+            bg=ModernStyle.BG_SECONDARY,
+            fg=ModernStyle.TEXT_SECONDARY,
+            font=ModernStyle.FONT_SMALL,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        self.output_zoom_value_label = tk.Label(
+            output_zoom_bar,
+            text="100%",
+            bg=ModernStyle.BG_SECONDARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            font=ModernStyle.FONT_SMALL,
+        )
+        self.output_zoom_value_label.pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            output_zoom_bar,
+            text="−",
+            command=lambda: self._adjust_output_preview_zoom(1.0 / PREVIEW_ZOOM_STEP),
+            width=3,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            relief=tk.FLAT,
+            highlightthickness=0,
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            output_zoom_bar,
+            text="100%",
+            command=self._reset_output_preview_zoom,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            relief=tk.FLAT,
+            highlightthickness=0,
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            output_zoom_bar,
+            text="+",
+            command=lambda: self._adjust_output_preview_zoom(PREVIEW_ZOOM_STEP),
+            width=3,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            relief=tk.FLAT,
+            highlightthickness=0,
+        ).pack(side=tk.LEFT, padx=2)
+
+        self.output_preview_canvas = tk.Canvas(
+            output_preview_frame,
+            bg=ModernStyle.BG_TERTIARY,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.output_preview_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.output_preview_canvas.bind("<Button-1>", self._on_output_preview_canvas_click)
+        self.output_preview_canvas.bind("<MouseWheel>", self._on_output_preview_mousewheel)
+        self.output_preview_canvas.bind("<Button-4>", self._on_output_preview_mousewheel)
+        self.output_preview_canvas.bind("<Button-5>", self._on_output_preview_mousewheel)
+        self.output_preview_canvas.bind("<Configure>", self._on_output_preview_canvas_configure)
+
         self._refresh_image_cleanup_controls()
+        self._refresh_output_action_buttons()
 
     def create_video_tab(self, parent):
         """Create the video frame extraction tab"""
@@ -912,12 +1130,21 @@ class BackgroundRemoverApp:
         )
         self.clear_cleanup_colors_btn.pack(side=tk.LEFT)
 
+        video_cleanup_summary_row = ttk.Frame(cleanup_frame)
+        video_cleanup_summary_row.pack(fill=tk.X, pady=(6, 0))
+
+        self.video_cleanup_swatches_frame = tk.Frame(
+            video_cleanup_summary_row,
+            bg=ModernStyle.BG_PRIMARY,
+        )
+        self.video_cleanup_swatches_frame.pack(side=tk.LEFT)
+
         self.video_cleanup_colors_label = ttk.Label(
-            cleanup_frame,
+            video_cleanup_summary_row,
             text="No cleanup colors selected.",
             style='Small.TLabel',
         )
-        self.video_cleanup_colors_label.pack(anchor=tk.W)
+        self.video_cleanup_colors_label.pack(side=tk.LEFT, padx=(8, 0))
 
         controls_row = ttk.Frame(parent)
         controls_row.pack(fill=tk.X, pady=(0, 15))
@@ -1454,6 +1681,7 @@ class BackgroundRemoverApp:
         self.video_cleanup_colors_label.configure(
             text=f"Cleanup colors: {self._cleanup_colors_summary()}. Tolerance: {self.video_cleanup_threshold.get()}"
         )
+        self._rebuild_cleanup_swatches(self.video_cleanup_swatches_frame, self.video_cleanup_colors)
 
         if self.video_processing:
             self.pick_cleanup_color_btn.configure_state("disabled")
@@ -2059,12 +2287,18 @@ class BackgroundRemoverApp:
         if getattr(self, "pick_image_cleanup_color_btn", None) is None:
             return
 
-        if self.image_preview_color_pick_active:
-            self.pick_image_cleanup_color_btn.set_text("Click Input To Sample")
-            self.input_preview.configure(cursor="crosshair")
+        if self.image_color_pick_mode == "input":
+            self.pick_image_cleanup_color_btn.set_text("Click input preview to sample")
+            self.input_preview_canvas.configure(cursor="crosshair")
+            self.output_preview_canvas.configure(cursor="")
+        elif self.image_color_pick_mode == "output":
+            self.pick_image_cleanup_color_btn.set_text("Click output preview to sample")
+            self.input_preview_canvas.configure(cursor="")
+            self.output_preview_canvas.configure(cursor="crosshair")
         else:
-            self.pick_image_cleanup_color_btn.set_text("Sample From Input")
-            self.input_preview.configure(cursor="")
+            self.pick_image_cleanup_color_btn.set_text("Sample: off (click to cycle)")
+            self.input_preview_canvas.configure(cursor="")
+            self.output_preview_canvas.configure(cursor="")
 
         self.image_cleanup_colors_label.configure(
             text=(
@@ -2072,28 +2306,42 @@ class BackgroundRemoverApp:
                 f"Tolerance: {self.image_cleanup_threshold.get()}"
             )
         )
+        self._rebuild_cleanup_swatches(self.image_cleanup_swatches_frame, self.image_cleanup_colors)
 
         has_input = bool(self.input_file.get()) and os.path.exists(self.input_file.get())
         if self.processing:
             self.pick_image_cleanup_color_btn.configure_state("disabled")
             self.add_image_cleanup_color_btn.configure_state("disabled")
             self.clear_image_cleanup_colors_btn.configure_state("disabled")
+            if getattr(self, "apply_cleanup_save_btn", None):
+                self.apply_cleanup_save_btn.configure_state("disabled")
             return
 
         self.pick_image_cleanup_color_btn.configure_state("normal" if has_input else "disabled")
         self.add_image_cleanup_color_btn.configure_state("normal")
         self.clear_image_cleanup_colors_btn.configure_state("normal" if self.image_cleanup_colors else "disabled")
+        if getattr(self, "apply_cleanup_save_btn", None):
+            self.apply_cleanup_save_btn.configure_state("normal" if has_input else "disabled")
 
     def _on_image_cleanup_threshold_change(self, _value):
         self.image_cleanup_threshold_value_label.configure(text=str(self.image_cleanup_threshold.get()))
         self._refresh_image_cleanup_controls()
 
     def _toggle_image_preview_color_pick(self):
-        if not self.input_file.get() or not os.path.exists(self.input_file.get()) or self.input_photo is None:
-            messagebox.showerror("Error", "Select an input image before sampling a cleanup color.")
-            return
+        has_input = bool(self.input_file.get()) and os.path.isfile(self.input_file.get())
+        out_path = self.output_file.get()
+        has_output = bool(out_path) and os.path.isfile(out_path)
 
-        self.image_preview_color_pick_active = not self.image_preview_color_pick_active
+        if self.image_color_pick_mode == "off":
+            if not has_input:
+                messagebox.showerror("Error", "Select an input image before sampling a cleanup color.")
+                return
+            self.image_color_pick_mode = "input"
+        elif self.image_color_pick_mode == "input":
+            self.image_color_pick_mode = "output" if has_output else "off"
+        else:
+            self.image_color_pick_mode = "off"
+
         self._refresh_image_cleanup_controls()
 
     def _choose_image_cleanup_color(self):
@@ -2112,41 +2360,428 @@ class BackgroundRemoverApp:
         if normalized_color not in self.image_cleanup_colors:
             self.image_cleanup_colors.append(normalized_color)
 
-        self.image_preview_color_pick_active = False
+        self.image_color_pick_mode = "off"
         self._refresh_image_cleanup_controls()
 
     def _clear_image_cleanup_colors(self):
         self.image_cleanup_colors = []
-        self.image_preview_color_pick_active = False
+        self.image_color_pick_mode = "off"
         self._refresh_image_cleanup_controls()
 
-    def _on_input_preview_click(self, event):
-        if not self.image_preview_color_pick_active or not self.input_file.get() or self.input_photo is None:
+    def _rebuild_cleanup_swatches(self, parent_frame, colors):
+        """Draw small color circles for the cleanup color list."""
+        if parent_frame is None:
+            return
+        for child in parent_frame.winfo_children():
+            child.destroy()
+        for rgb in colors[:COLOR_SWATCH_MAX_VISIBLE]:
+            swatch = tk.Canvas(
+                parent_frame,
+                width=COLOR_SWATCH_SIZE,
+                height=COLOR_SWATCH_SIZE,
+                bg=ModernStyle.BG_PRIMARY,
+                highlightthickness=1,
+                highlightbackground=ModernStyle.BORDER,
+                highlightcolor=ModernStyle.BORDER,
+            )
+            pad = 2
+            swatch.create_oval(
+                pad,
+                pad,
+                COLOR_SWATCH_SIZE - pad,
+                COLOR_SWATCH_SIZE - pad,
+                fill=tk_rgb_from_color_tuple(rgb),
+                outline=ModernStyle.BORDER,
+            )
+            swatch.pack(side=tk.LEFT, padx=(0, 2))
+        if len(colors) > COLOR_SWATCH_MAX_VISIBLE:
+            ttk.Label(
+                parent_frame,
+                text=f"+{len(colors) - COLOR_SWATCH_MAX_VISIBLE}",
+                style="Small.TLabel",
+            ).pack(side=tk.LEFT, padx=(2, 0))
+
+    def _clamp_preview_zoom(self, value):
+        return max(PREVIEW_ZOOM_MIN, min(PREVIEW_ZOOM_MAX, float(value)))
+
+    def _update_input_zoom_label(self):
+        if getattr(self, "input_zoom_value_label", None):
+            pct = int(round(self.input_preview_zoom.get() * 100))
+            self.input_zoom_value_label.configure(text=f"{pct}%")
+
+    def _update_output_zoom_label(self):
+        if getattr(self, "output_zoom_value_label", None):
+            pct = int(round(self.output_preview_zoom.get() * 100))
+            self.output_zoom_value_label.configure(text=f"{pct}%")
+
+    def _open_image_for_preview(self, filepath):
+        """Load an image with EXIF orientation applied for accurate previews and sampling."""
+        img = Image.open(filepath)
+        try:
+            from PIL import ImageOps
+
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass
+        return img
+
+    def _build_scaled_preview(self, filepath, zoom):
+        """Return (display PIL image, source width, source height) for preview drawing."""
+        img = self._open_image_for_preview(filepath)
+        try:
+            source_w, source_h = img.size
+            z = self._clamp_preview_zoom(zoom)
+            max_w = min(int(PREVIEW_BASE_WIDTH * z), PREVIEW_MAX_DISPLAY_SIDE)
+            max_h = min(int(PREVIEW_BASE_HEIGHT * z), PREVIEW_MAX_DISPLAY_SIDE)
+            thumb = img.copy()
+            thumb.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+            return thumb, source_w, source_h
+        finally:
+            img.close()
+
+    def _draw_preview_canvas_placeholder(self, canvas, message):
+        canvas.delete("all")
+        canvas.update_idletasks()
+        cw = max(canvas.winfo_width(), 120)
+        ch = max(canvas.winfo_height(), 80)
+        canvas.create_text(
+            cw // 2,
+            ch // 2,
+            text=message,
+            fill=ModernStyle.TEXT_SECONDARY,
+            font=ModernStyle.FONT_SMALL,
+            anchor=tk.CENTER,
+        )
+
+    def _redraw_input_preview(self):
+        if getattr(self, "input_preview_canvas", None) is None:
+            return
+        canvas = self.input_preview_canvas
+        path = self.input_file.get()
+        canvas.delete("all")
+        self.input_preview_image_id = None
+        self._input_preview_draw = None
+        self._input_source_size = None
+        self.input_photo = None
+
+        if not path or not os.path.isfile(path):
+            self._draw_preview_canvas_placeholder(canvas, "No image selected")
+            self._refresh_image_cleanup_controls()
             return
 
-        display_width = self.input_photo.width()
-        display_height = self.input_photo.height()
-        widget_width = max(self.input_preview.winfo_width(), display_width)
-        widget_height = max(self.input_preview.winfo_height(), display_height)
-        x_offset = max((widget_width - display_width) // 2, 0)
-        y_offset = max((widget_height - display_height) // 2, 0)
+        try:
+            thumb, sw, sh = self._build_scaled_preview(path, self.input_preview_zoom.get())
+            self._input_source_size = (sw, sh)
+            dw, dh = thumb.size
+            cw = max(canvas.winfo_width(), 1)
+            ch = max(canvas.winfo_height(), 1)
+            cx = cw // 2
+            cy = ch // 2
+            self.input_photo = ImageTk.PhotoImage(thumb)
+            self.input_preview_image_id = canvas.create_image(cx, cy, image=self.input_photo, anchor=tk.CENTER)
+            x0 = cx - dw // 2
+            y0 = cy - dh // 2
+            self._input_preview_draw = {
+                "x0": x0,
+                "y0": y0,
+                "dw": dw,
+                "dh": dh,
+                "sw": sw,
+                "sh": sh,
+                "path": path,
+            }
+        except Exception as exc:
+            self._draw_preview_canvas_placeholder(canvas, f"Error: {str(exc)[:40]}")
 
-        local_x = event.x - x_offset
-        local_y = event.y - y_offset
-        if local_x < 0 or local_y < 0 or local_x >= display_width or local_y >= display_height:
+        self._update_input_zoom_label()
+        self._refresh_image_cleanup_controls()
+
+    def _redraw_output_preview(self):
+        if getattr(self, "output_preview_canvas", None) is None:
+            return
+        canvas = self.output_preview_canvas
+        path = self.output_preview_display_path
+        if path is None:
+            path = self.output_file.get()
+        canvas.delete("all")
+        self.output_preview_image_id = None
+        self._output_preview_draw = None
+        self._output_source_size = None
+        self.output_photo = None
+
+        if not path or not os.path.isfile(path):
+            self._draw_preview_canvas_placeholder(canvas, "No output yet")
+            self._update_output_zoom_label()
             return
 
-        with Image.open(self.input_file.get()) as opened_image:
-            source_image = opened_image.convert("RGB")
-            source_x = min(source_image.width - 1, max(0, int(local_x * source_image.width / display_width)))
-            source_y = min(source_image.height - 1, max(0, int(local_y * source_image.height / display_height)))
-            sampled_color = source_image.getpixel((source_x, source_y))
+        try:
+            thumb, sw, sh = self._build_scaled_preview(path, self.output_preview_zoom.get())
+            self._output_source_size = (sw, sh)
+            dw, dh = thumb.size
+            cw = max(canvas.winfo_width(), 1)
+            ch = max(canvas.winfo_height(), 1)
+            cx = cw // 2
+            cy = ch // 2
+            self.output_photo = ImageTk.PhotoImage(thumb)
+            self.output_preview_image_id = canvas.create_image(cx, cy, image=self.output_photo, anchor=tk.CENTER)
+            x0 = cx - dw // 2
+            y0 = cy - dh // 2
+            self._output_preview_draw = {
+                "x0": x0,
+                "y0": y0,
+                "dw": dw,
+                "dh": dh,
+                "sw": sw,
+                "sh": sh,
+                "path": path,
+            }
+        except Exception as exc:
+            self._draw_preview_canvas_placeholder(canvas, f"Error: {str(exc)[:40]}")
 
-        self._add_image_cleanup_color(sampled_color)
+        self._update_output_zoom_label()
+
+    def _on_input_preview_canvas_configure(self, event):
+        if (event.width, event.height) == self._input_preview_canvas_size:
+            return
+        self._input_preview_canvas_size = (event.width, event.height)
+        self._redraw_input_preview()
+
+    def _on_output_preview_canvas_configure(self, event):
+        if (event.width, event.height) == self._output_preview_canvas_size:
+            return
+        self._output_preview_canvas_size = (event.width, event.height)
+        self._redraw_output_preview()
+
+    def _adjust_input_preview_zoom(self, factor):
+        new_z = self._clamp_preview_zoom(self.input_preview_zoom.get() * factor)
+        self.input_preview_zoom.set(new_z)
+        self._redraw_input_preview()
+
+    def _adjust_output_preview_zoom(self, factor):
+        new_z = self._clamp_preview_zoom(self.output_preview_zoom.get() * factor)
+        self.output_preview_zoom.set(new_z)
+        self._redraw_output_preview()
+
+    def _reset_input_preview_zoom(self):
+        self.input_preview_zoom.set(1.0)
+        self._redraw_input_preview()
+
+    def _reset_output_preview_zoom(self):
+        self.output_preview_zoom.set(1.0)
+        self._redraw_output_preview()
+
+    def _on_input_preview_mousewheel(self, event):
+        if getattr(event, "num", None) == 4:
+            self._adjust_input_preview_zoom(PREVIEW_ZOOM_STEP)
+        elif getattr(event, "num", None) == 5:
+            self._adjust_input_preview_zoom(1.0 / PREVIEW_ZOOM_STEP)
+        else:
+            delta = getattr(event, "delta", 0)
+            if delta > 0:
+                self._adjust_input_preview_zoom(PREVIEW_ZOOM_STEP)
+            elif delta < 0:
+                self._adjust_input_preview_zoom(1.0 / PREVIEW_ZOOM_STEP)
+        return "break"
+
+    def _on_output_preview_mousewheel(self, event):
+        if getattr(event, "num", None) == 4:
+            self._adjust_output_preview_zoom(PREVIEW_ZOOM_STEP)
+        elif getattr(event, "num", None) == 5:
+            self._adjust_output_preview_zoom(1.0 / PREVIEW_ZOOM_STEP)
+        else:
+            delta = getattr(event, "delta", 0)
+            if delta > 0:
+                self._adjust_output_preview_zoom(PREVIEW_ZOOM_STEP)
+            elif delta < 0:
+                self._adjust_output_preview_zoom(1.0 / PREVIEW_ZOOM_STEP)
+        return "break"
+
+    def _sample_rgb_from_draw(self, draw_info, event_x, event_y):
+        """Map a canvas click to an RGB tuple using draw_info from _redraw_*_preview."""
+        if not draw_info:
+            return None
+        ix = event_x
+        iy = event_y
+        x0 = draw_info["x0"]
+        y0 = draw_info["y0"]
+        dw = draw_info["dw"]
+        dh = draw_info["dh"]
+        sw = draw_info["sw"]
+        sh = draw_info["sh"]
+        path = draw_info["path"]
+        if ix < x0 or iy < y0 or ix >= x0 + dw or iy >= y0 + dh:
+            return None
+        local_x = ix - x0
+        local_y = iy - y0
+        src_x = min(sw - 1, max(0, int(local_x * sw / max(dw, 1))))
+        src_y = min(sh - 1, max(0, int(local_y * sh / max(dh, 1))))
+        img = self._open_image_for_preview(path)
+        try:
+            rgb_img = img.convert("RGB")
+            return rgb_img.getpixel((src_x, src_y))
+        finally:
+            img.close()
+
+    def _on_input_preview_canvas_click(self, event):
+        if self.image_color_pick_mode != "input":
+            return
+        sampled = self._sample_rgb_from_draw(self._input_preview_draw, event.x, event.y)
+        if sampled is None:
+            return
+        self._add_image_cleanup_color(sampled)
         self.status_label.configure(
-            text=f"Added cleanup color {format_rgb_color(sampled_color)}. Matching pixels will be removed before save.",
+            text=f"Added cleanup color {format_rgb_color(sampled)}. Matching pixels will be removed before save.",
             foreground=ModernStyle.SUCCESS,
         )
+
+    def _on_output_preview_canvas_click(self, event):
+        if self.image_color_pick_mode != "output":
+            return
+        sampled = self._sample_rgb_from_draw(self._output_preview_draw, event.x, event.y)
+        if sampled is None:
+            return
+        self._add_image_cleanup_color(sampled)
+        self.status_label.configure(
+            text=f"Added cleanup color {format_rgb_color(sampled)} from output preview.",
+            foreground=ModernStyle.SUCCESS,
+        )
+
+    def _set_last_saved_output_hint(self, path):
+        if path:
+            self.last_saved_output_hint.set(f"Last saved: {path}")
+        else:
+            self.last_saved_output_hint.set("")
+
+    def _refresh_output_action_buttons(self):
+        if getattr(self, "use_output_as_input_btn", None) is None:
+            return
+        out_path = self.output_file.get()
+        has_output_file = bool(out_path) and os.path.isfile(out_path)
+        busy = self.processing
+        self.use_output_as_input_btn.configure_state("normal" if has_output_file and not busy else "disabled")
+        self.save_output_copy_btn.configure_state("normal" if has_output_file and not busy else "disabled")
+        if sys.platform == "darwin" and getattr(self, "reveal_output_btn", None):
+            self.reveal_output_btn.configure_state("normal" if has_output_file and not busy else "disabled")
+
+    def use_output_as_input(self):
+        """Set the current output file as the input image for cleanup refinement."""
+        out_path = (self.output_file.get() or "").strip()
+        if not out_path or not os.path.isfile(out_path):
+            messagebox.showerror("Error", "No saved output file found. Run Remove Background or Apply cleanup & save first.")
+            return
+        self.input_file.set(out_path)
+        self.load_input_preview(out_path)
+        self._refresh_output_action_buttons()
+
+    def save_output_as_copy(self):
+        """Copy the current output file to a path the user chooses."""
+        src = (self.output_file.get() or "").strip()
+        if not src or not os.path.isfile(src):
+            messagebox.showerror("Error", "There is no output file to save yet.")
+            return
+        dest = filedialog.asksaveasfilename(
+            title="Save Output Copy As",
+            defaultextension=".png",
+            filetypes=[("PNG files", "*.png"), ("All files", "*.*")],
+        )
+        if not dest:
+            return
+        try:
+            shutil.copy2(src, dest)
+            self.output_file.set(dest)
+            self._set_last_saved_output_hint(dest)
+            self.load_output_preview()
+            self.status_label.configure(
+                text=f"Output copied to {dest}",
+                foreground=ModernStyle.SUCCESS,
+            )
+            self._refresh_output_action_buttons()
+        except OSError as exc:
+            messagebox.showerror("Error", f"Could not save copy:\n{exc}")
+
+    def reveal_output_in_finder(self):
+        """Show the output file in Finder (macOS)."""
+        path = (self.output_file.get() or "").strip()
+        if not path or not os.path.isfile(path):
+            messagebox.showerror("Error", "No output file to reveal.")
+            return
+        try:
+            subprocess.run(["open", "-R", path], check=False)
+        except OSError as exc:
+            messagebox.showerror("Error", f"Could not reveal file:\n{exc}")
+
+    def apply_cleanup_and_save(self):
+        """Apply color cleanup to the current input (RGBA) and save without running the AI model."""
+        in_path = (self.input_file.get() or "").strip()
+        out_path = (self.output_file.get() or "").strip()
+        if not in_path or not os.path.isfile(in_path):
+            messagebox.showerror("Error", "Select an input image file first.")
+            return
+        if not out_path:
+            messagebox.showerror("Error", "Specify an output file path.")
+            return
+        if self.processing:
+            return
+        self.processing = True
+        self.process_btn.configure_state("disabled")
+        self.sprite_process_btn.configure_state("disabled")
+        self.apply_cleanup_save_btn.configure_state("disabled")
+        self._refresh_image_cleanup_controls()
+        self._refresh_output_action_buttons()
+        self.progress.start(10)
+        self.status_label.configure(text="Applying color cleanup…", foreground=ModernStyle.TEXT_SECONDARY)
+        thread = threading.Thread(target=self._apply_cleanup_only_thread, daemon=True)
+        thread.start()
+
+    def _apply_cleanup_only_thread(self):
+        try:
+            img = Image.open(self.input_file.get())
+            try:
+                from PIL import ImageOps
+
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
+            try:
+                rgba = img.convert("RGBA")
+                cutout = apply_color_cleanup(rgba, self.image_cleanup_colors, self.image_cleanup_threshold.get())
+                if self.auto_crop_output.get():
+                    cutout = crop_to_visible_bounds(cutout)
+                cutout.save(self.output_file.get(), "PNG")
+            finally:
+                img.close()
+            self.root.after(0, self._on_cleanup_only_success)
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            self.root.after(0, lambda: self._on_cleanup_only_error(str(e)))
+
+    def _on_cleanup_only_success(self):
+        self.processing = False
+        self.progress.stop()
+        self.process_btn.configure_state("normal")
+        self.sprite_process_btn.configure_state("normal")
+        self.apply_cleanup_save_btn.configure_state("normal")
+        self._refresh_image_cleanup_controls()
+        self._refresh_output_action_buttons()
+        self._set_last_saved_output_hint(self.output_file.get())
+        self.load_output_preview()
+        self.status_label.configure(
+            text="Cleanup applied and saved.",
+            foreground=ModernStyle.SUCCESS,
+        )
+
+    def _on_cleanup_only_error(self, error_msg):
+        self.processing = False
+        self.progress.stop()
+        self.process_btn.configure_state("normal")
+        self.sprite_process_btn.configure_state("normal")
+        self.apply_cleanup_save_btn.configure_state("normal")
+        self._refresh_image_cleanup_controls()
+        self._refresh_output_action_buttons()
+        self.status_label.configure(text="Cleanup save failed.", foreground=ModernStyle.ERROR)
+        messagebox.showerror("Error", f"Apply cleanup failed:\n\n{error_msg}")
     
     def browse_input(self):
         """Open file dialog for input image"""
@@ -2170,7 +2805,9 @@ class BackgroundRemoverApp:
             # Always update output filename when input changes
             base, ext = os.path.splitext(filename)
             self.output_file.set(f"{base}_no_bg.png")
-    
+            self.output_preview_display_path = None
+            self.load_output_preview()
+
     def browse_output(self):
         """Open file dialog for output location"""
         filetypes = [
@@ -2186,6 +2823,8 @@ class BackgroundRemoverApp:
         
         if filename:
             self.output_file.set(filename)
+            self.output_preview_display_path = None
+            self.load_output_preview()
 
     def browse_sprite_output(self):
         """Open file dialog for sprite-kit output folder."""
@@ -2198,28 +2837,19 @@ class BackgroundRemoverApp:
             self.sprite_output_dir.set(directory)
     
     def load_input_preview(self, filepath):
-        """Load and display input image preview"""
-        try:
-            image = Image.open(filepath)
-            image.thumbnail((250, 200), Image.Resampling.LANCZOS)
-            
-            self.input_photo = ImageTk.PhotoImage(image)
-            self.input_preview.configure(image=self.input_photo, text="")
-            self._refresh_image_cleanup_controls()
-        except Exception as e:
-            self.input_preview.configure(image="", text=f"Error: {str(e)[:30]}...")
-    
-    def load_output_preview(self, filepath):
-        """Load and display output image preview"""
-        try:
-            if os.path.exists(filepath):
-                image = Image.open(filepath)
-                image.thumbnail((250, 200), Image.Resampling.LANCZOS)
-                
-                self.output_photo = ImageTk.PhotoImage(image)
-                self.output_preview.configure(image=self.output_photo, text="")
-        except Exception as e:
-            self.output_preview.configure(image="", text=f"Error: {str(e)[:30]}...")
+        """Load and display input image preview on the zoomable canvas."""
+        self.input_file.set(filepath)
+        self._redraw_input_preview()
+        self._refresh_output_action_buttons()
+
+    def load_output_preview(self, filepath=None):
+        """Redraw the output preview. Pass a path to preview that file without changing Output File (e.g. sprite). Pass None to show the current Output File path."""
+        if filepath is not None:
+            self.output_preview_display_path = filepath
+        else:
+            self.output_preview_display_path = None
+        self._redraw_output_preview()
+        self._refresh_output_action_buttons()
     
     def process_image(self):
         """Start image processing"""
@@ -2243,7 +2873,9 @@ class BackgroundRemoverApp:
         self.sprite_process_btn.configure_state("disabled")
         self.progress.start(10)
         self.status_label.configure(text="Processing... Please wait.")
-        
+        self._refresh_image_cleanup_controls()
+        self._refresh_output_action_buttons()
+
         thread = threading.Thread(target=self._process_thread)
         thread.daemon = True
         thread.start()
@@ -2267,6 +2899,9 @@ class BackgroundRemoverApp:
         self.processing = True
         self.process_btn.configure_state("disabled")
         self.sprite_process_btn.configure_state("disabled")
+        if getattr(self, "apply_cleanup_save_btn", None):
+            self.apply_cleanup_save_btn.configure_state("disabled")
+        self._refresh_output_action_buttons()
         self.progress.start(10)
         self.status_label.configure(text="Building smart sprite kit... Please wait.")
 
@@ -2475,9 +3110,10 @@ class BackgroundRemoverApp:
         self.sprite_process_btn.configure_state("normal")
         self._refresh_image_cleanup_controls()
         self.status_label.configure(text="✓ Background removed successfully!", foreground=ModernStyle.SUCCESS)
-        
-        self.load_output_preview(self.output_file.get())
-        
+
+        self._set_last_saved_output_hint(self.output_file.get())
+        self.load_output_preview()
+
         messagebox.showinfo("Success", f"Background removed!\n\nSaved to:\n{self.output_file.get()}")
 
     def _on_sprite_kit_success(self, result, target_dir):
@@ -2486,6 +3122,8 @@ class BackgroundRemoverApp:
         self.progress.stop()
         self.process_btn.configure_state("normal")
         self.sprite_process_btn.configure_state("normal")
+        self._refresh_image_cleanup_controls()
+        self._refresh_output_action_buttons()
         sprite_count = int(result.get("sprite_count", 0))
         self.status_label.configure(
             text=f"✓ Smart sprite kit exported {sprite_count} sprite(s)!",
@@ -2497,7 +3135,8 @@ class BackgroundRemoverApp:
             first_sprite_path = os.path.join(target_dir, sprites[0]["filename"])
             self.load_output_preview(first_sprite_path)
         else:
-            self.output_preview.configure(image="", text="No sprites exported")
+            self.output_preview_display_path = None
+            self._redraw_output_preview()
 
         manifest_path = result.get("manifest_path", "")
         messagebox.showinfo(
@@ -2512,8 +3151,9 @@ class BackgroundRemoverApp:
         self.process_btn.configure_state("normal")
         self.sprite_process_btn.configure_state("normal")
         self._refresh_image_cleanup_controls()
+        self._refresh_output_action_buttons()
         self.status_label.configure(text="✗ Processing failed", foreground=ModernStyle.ERROR)
-        
+
         messagebox.showerror("Error", f"Failed to process image:\n\n{error_msg}")
 
 
