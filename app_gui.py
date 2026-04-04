@@ -17,6 +17,7 @@ from PIL import Image, ImageTk
 import threading
 import io
 import numpy as np
+from backgroundremover import bg
 
 DUPLICATE_FRAME_SIGNATURE_SIZE = (24, 24)
 DUPLICATE_FRAME_MAX_MEAN_DIFFERENCE = 0.015
@@ -252,8 +253,10 @@ class BackgroundRemoverApp:
         # Variables
         self.input_file = tk.StringVar()
         self.output_file = tk.StringVar()
+        self.sprite_output_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads"))
         self.model_choice = tk.StringVar(value="u2net")
         self.alpha_matting = tk.BooleanVar(value=False)
+        self.auto_crop_output = tk.BooleanVar(value=True)
         self.processing = False
         self.video_processing = False
         
@@ -434,6 +437,39 @@ class BackgroundRemoverApp:
                                              bg=ModernStyle.BG_TERTIARY,
                                              hover_bg=ModernStyle.BORDER)
         self.browse_output_btn.pack(side=tk.RIGHT)
+
+        sprite_output_frame = ttk.Frame(file_frame)
+        sprite_output_frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Label(sprite_output_frame, text="Sprite Output Folder").pack(anchor=tk.W)
+
+        sprite_output_entry_frame = ttk.Frame(sprite_output_frame)
+        sprite_output_entry_frame.pack(fill=tk.X, pady=(5, 0))
+
+        self.sprite_output_entry = tk.Entry(
+            sprite_output_entry_frame,
+            textvariable=self.sprite_output_dir,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            insertbackground=ModernStyle.TEXT_PRIMARY,
+            relief=tk.FLAT,
+            font=ModernStyle.FONT_BODY,
+            highlightthickness=1,
+            highlightbackground=ModernStyle.BORDER,
+            highlightcolor=ModernStyle.ACCENT,
+        )
+        self.sprite_output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(0, 10))
+
+        self.browse_sprite_output_btn = RoundedButton(
+            sprite_output_entry_frame,
+            text="Browse",
+            command=self.browse_sprite_output,
+            width=100,
+            height=36,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.browse_sprite_output_btn.pack(side=tk.RIGHT)
         
         # Options section
         options_frame = ttk.Frame(parent)
@@ -472,6 +508,17 @@ class BackgroundRemoverApp:
                                     padx=5,
                                     font=ModernStyle.FONT_BODY)
         alpha_check.pack(anchor=tk.W)
+
+        crop_check = tk.Checkbutton(options_frame, text="Auto Crop To Content",
+                                   variable=self.auto_crop_output,
+                                   bg=ModernStyle.BG_PRIMARY,
+                                   fg=ModernStyle.TEXT_PRIMARY,
+                                   selectcolor=ModernStyle.BG_TERTIARY,
+                                   activebackground=ModernStyle.BG_PRIMARY,
+                                   activeforeground=ModernStyle.ACCENT,
+                                   padx=5,
+                                   font=ModernStyle.FONT_BODY)
+        crop_check.pack(anchor=tk.W, pady=(8, 0))
         
         # Process button
         self.process_btn = RoundedButton(parent, text="Remove Background",
@@ -482,6 +529,19 @@ class BackgroundRemoverApp:
                                         hover_bg=ModernStyle.ACCENT_HOVER,
                                         font=ModernStyle.FONT_BUTTON)
         self.process_btn.pack(pady=(10, 20))
+
+        self.sprite_process_btn = RoundedButton(
+            parent,
+            text="Smart Sprite Kit Cut",
+            command=self.process_sprite_kit,
+            width=280,
+            height=50,
+            radius=15,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+            font=ModernStyle.FONT_BUTTON,
+        )
+        self.sprite_process_btn.pack(pady=(0, 20))
         
         # Progress bar
         self.progress = ttk.Progressbar(parent, mode='indeterminate', style='TProgressbar')
@@ -1940,6 +2000,16 @@ class BackgroundRemoverApp:
         
         if filename:
             self.output_file.set(filename)
+
+    def browse_sprite_output(self):
+        """Open file dialog for sprite-kit output folder."""
+        directory = filedialog.askdirectory(
+            title="Select Sprite Output Folder",
+            initialdir=self.sprite_output_dir.get() or os.path.join(os.path.expanduser("~"), "Downloads"),
+        )
+
+        if directory:
+            self.sprite_output_dir.set(directory)
     
     def load_input_preview(self, filepath):
         """Load and display input image preview"""
@@ -1983,10 +2053,37 @@ class BackgroundRemoverApp:
         
         self.processing = True
         self.process_btn.configure_state("disabled")
+        self.sprite_process_btn.configure_state("disabled")
         self.progress.start(10)
         self.status_label.configure(text="Processing... Please wait.")
         
         thread = threading.Thread(target=self._process_thread)
+        thread.daemon = True
+        thread.start()
+
+    def process_sprite_kit(self):
+        """Start smart sprite-kit export for the selected image."""
+        if not self.input_file.get():
+            messagebox.showerror("Error", "Please select an input image.")
+            return
+
+        if not os.path.exists(self.input_file.get()):
+            messagebox.showerror("Error", "Input file does not exist.")
+            return
+
+        if self.processing:
+            return
+
+        target_dir = self.sprite_output_dir.get() or os.path.join(os.path.expanduser("~"), "Downloads")
+        os.makedirs(target_dir, exist_ok=True)
+
+        self.processing = True
+        self.process_btn.configure_state("disabled")
+        self.sprite_process_btn.configure_state("disabled")
+        self.progress.start(10)
+        self.status_label.configure(text="Building smart sprite kit... Please wait.")
+
+        thread = threading.Thread(target=self._process_sprite_kit_thread, args=(target_dir,))
         thread.daemon = True
         thread.start()
     
@@ -2145,6 +2242,8 @@ class BackgroundRemoverApp:
             net = self._load_model(self.model_choice.get())
             
             cutout = self._create_cutout_for_image(img, net, self.alpha_matting.get())
+            if self.auto_crop_output.get():
+                cutout = crop_to_visible_bounds(cutout)
             
             # Save
             cutout.save(self.output_file.get(), "PNG")
@@ -2155,23 +2254,70 @@ class BackgroundRemoverApp:
             import traceback
             traceback.print_exc()
             self.root.after(0, lambda: self._on_error(str(e)))
+
+    def _process_sprite_kit_thread(self, target_dir):
+        """Background processing thread for smart sprite-kit export."""
+        try:
+            prefix = resolve_output_prefix(
+                os.path.splitext(os.path.basename(self.input_file.get()))[0],
+                "sprite",
+            )
+            result = bg.create_sprite_kit(
+                self.input_file.get(),
+                destination_dir=target_dir,
+                prefix=prefix,
+                model_name=self.model_choice.get(),
+                alpha_matting=self.alpha_matting.get(),
+            )
+            self.root.after(0, lambda: self._on_sprite_kit_success(result, target_dir))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.root.after(0, lambda: self._on_error(str(e)))
     
     def _on_success(self):
         """Called on successful processing"""
         self.processing = False
         self.progress.stop()
         self.process_btn.configure_state("normal")
+        self.sprite_process_btn.configure_state("normal")
         self.status_label.configure(text="✓ Background removed successfully!", foreground=ModernStyle.SUCCESS)
         
         self.load_output_preview(self.output_file.get())
         
         messagebox.showinfo("Success", f"Background removed!\n\nSaved to:\n{self.output_file.get()}")
+
+    def _on_sprite_kit_success(self, result, target_dir):
+        """Called on successful sprite-kit export."""
+        self.processing = False
+        self.progress.stop()
+        self.process_btn.configure_state("normal")
+        self.sprite_process_btn.configure_state("normal")
+        sprite_count = int(result.get("sprite_count", 0))
+        self.status_label.configure(
+            text=f"✓ Smart sprite kit exported {sprite_count} sprite(s)!",
+            foreground=ModernStyle.SUCCESS,
+        )
+
+        sprites = result.get("sprites", [])
+        if sprites:
+            first_sprite_path = os.path.join(target_dir, sprites[0]["filename"])
+            self.load_output_preview(first_sprite_path)
+        else:
+            self.output_preview.configure(image="", text="No sprites exported")
+
+        manifest_path = result.get("manifest_path", "")
+        messagebox.showinfo(
+            "Success",
+            f"Smart sprite kit exported {sprite_count} sprite(s) to:\n\n{target_dir}\n\nManifest:\n{manifest_path}",
+        )
     
     def _on_error(self, error_msg):
         """Called on processing error"""
         self.processing = False
         self.progress.stop()
         self.process_btn.configure_state("normal")
+        self.sprite_process_btn.configure_state("normal")
         self.status_label.configure(text="✗ Processing failed", foreground=ModernStyle.ERROR)
         
         messagebox.showerror("Error", f"Failed to process image:\n\n{error_msg}")

@@ -1,10 +1,12 @@
 import io
+import json
 import os
 import typing
 from PIL import Image, ImageOps
 from pymatting.alpha.estimate_alpha_cf import estimate_alpha_cf
 from pymatting.foreground.estimate_foreground_ml import estimate_foreground_ml
 from pymatting.util.util import stack_images
+from scipy.ndimage import binary_dilation, find_objects, label
 from scipy.ndimage.morphology import binary_erosion
 from moviepy import VideoFileClip
 import numpy as np
@@ -248,6 +250,247 @@ def get_model(model_name):
         return detect.load_model(model_name="u2net")
 
 
+def _load_image(data):
+    if isinstance(data, Image.Image):
+        img = data
+    elif isinstance(data, (str, os.PathLike)):
+        try:
+            img = Image.open(data)
+        except Exception as e:
+            raise ValueError(f"Invalid image path input: {e}")
+    elif isinstance(data, np.ndarray):
+        img = Image.fromarray(data)
+    else:
+        try:
+            img = Image.open(io.BytesIO(data))
+        except Exception as e:
+            raise ValueError(f"Invalid image input: {e}")
+
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    return img.convert("RGB")
+
+
+def harden_sprite_mask(mask, threshold=128):
+    """Convert a soft mask into a binary mask suitable for crisp sprite extraction."""
+    return mask.convert("L").point(lambda p: 255 if p >= int(threshold) else 0)
+
+
+def _sprite_min_area_for_size(size):
+    width, height = size
+    return max(1, int(width * height * 0.0005))
+
+
+def _sprite_merge_distance_for_size(size):
+    width, height = size
+    return max(2, min(24, int(round(max(width, height) * 0.02))))
+
+
+def _bbox_from_component(component_slice):
+    y_slice, x_slice = component_slice
+    return (x_slice.start, y_slice.start, x_slice.stop, y_slice.stop)
+
+
+def _component_records(binary_mask):
+    labeled, component_count = label(binary_mask)
+    if component_count == 0:
+        return [], labeled
+
+    component_slices = find_objects(labeled)
+    records = []
+    for component_id, component_slice in enumerate(component_slices, start=1):
+        if component_slice is None:
+            continue
+        component_mask = labeled[component_slice] == component_id
+        area = int(component_mask.sum())
+        if area <= 0:
+            continue
+        bbox = _bbox_from_component(component_slice)
+        records.append(
+            {
+                "component_id": component_id,
+                "bbox": bbox,
+                "area": area,
+            }
+        )
+    return records, labeled
+
+
+def _merge_component_records(component_records, labeled_mask, merge_distance):
+    if not component_records:
+        return []
+
+    if merge_distance <= 0:
+        return [
+            {
+                "bbox": record["bbox"],
+                "component_ids": [record["component_id"]],
+                "area": record["area"],
+            }
+            for record in component_records
+        ]
+
+    expanded = binary_dilation(labeled_mask > 0, structure=np.ones((merge_distance * 2 + 1, merge_distance * 2 + 1), dtype=bool))
+    dilated_labels, _ = label(expanded)
+
+    grouped = {}
+    for record in component_records:
+        x1, y1, x2, y2 = record["bbox"]
+        overlap_labels = dilated_labels[y1:y2, x1:x2][labeled_mask[y1:y2, x1:x2] == record["component_id"]]
+        overlap_labels = overlap_labels[overlap_labels > 0]
+        if overlap_labels.size == 0:
+            group_id = record["component_id"]
+        else:
+            group_id = int(np.bincount(overlap_labels).argmax())
+
+        group = grouped.setdefault(
+            group_id,
+            {
+                "bbox": list(record["bbox"]),
+                "component_ids": [],
+                "area": 0,
+            },
+        )
+        group["component_ids"].append(record["component_id"])
+        group["area"] += record["area"]
+        group["bbox"][0] = min(group["bbox"][0], x1)
+        group["bbox"][1] = min(group["bbox"][1], y1)
+        group["bbox"][2] = max(group["bbox"][2], x2)
+        group["bbox"][3] = max(group["bbox"][3], y2)
+
+    merged = []
+    for group in grouped.values():
+        group["bbox"] = tuple(group["bbox"])
+        merged.append(group)
+    return merged
+
+
+def split_sprite_cutout(cutout, merge_distance=None, min_sprite_area=None):
+    """Split a transparent cutout into grouped sprite records ordered for export."""
+    rgba_cutout = cutout.convert("RGBA")
+    alpha = np.asarray(rgba_cutout.getchannel("A"))
+    binary_mask = alpha > 0
+    if not np.any(binary_mask):
+        return []
+
+    min_sprite_area = _sprite_min_area_for_size(rgba_cutout.size) if min_sprite_area is None else max(1, int(min_sprite_area))
+    merge_distance = _sprite_merge_distance_for_size(rgba_cutout.size) if merge_distance is None else max(0, int(merge_distance))
+
+    component_records, labeled_mask = _component_records(binary_mask)
+    component_records = [record for record in component_records if record["area"] >= min_sprite_area]
+    merged_records = _merge_component_records(component_records, labeled_mask, merge_distance)
+    merged_records = [record for record in merged_records if record["area"] >= min_sprite_area]
+
+    sprites = []
+    for record in sorted(merged_records, key=lambda item: (item["bbox"][1], item["bbox"][0])):
+        x1, y1, x2, y2 = record["bbox"]
+        sprite_image = rgba_cutout.crop((x1, y1, x2, y2))
+        sprites.append(
+            {
+                "bbox": (x1, y1, x2, y2),
+                "size": sprite_image.size,
+                "image": sprite_image,
+            }
+        )
+    return sprites
+
+
+def export_sprite_kit(cutout, destination_dir, prefix, model_name, merge_distance=None, min_sprite_area=None):
+    """Export split sprites and a manifest to the destination folder."""
+    os.makedirs(destination_dir, exist_ok=True)
+    sprites = split_sprite_cutout(cutout, merge_distance=merge_distance, min_sprite_area=min_sprite_area)
+
+    manifest = {
+        "source_size": list(cutout.size),
+        "model": model_name,
+        "sprite_count": len(sprites),
+        "sprites": [],
+    }
+
+    for index, sprite in enumerate(sprites, start=1):
+        filename = f"{prefix}_sprite_{index:03d}.png"
+        destination = os.path.join(destination_dir, filename)
+        sprite["image"].save(destination, "PNG")
+        manifest["sprites"].append(
+            {
+                "index": index,
+                "filename": filename,
+                "bbox": list(sprite["bbox"]),
+                "size": list(sprite["size"]),
+            }
+        )
+
+    manifest_path = os.path.join(destination_dir, f"{prefix}_sprite_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    return {
+        **manifest,
+        "manifest_path": manifest_path,
+    }
+
+
+def _mask_to_cutout(
+    img,
+    mask,
+    alpha_matting=False,
+    alpha_matting_foreground_threshold=240,
+    alpha_matting_background_threshold=10,
+    alpha_matting_erode_structure_size=10,
+    alpha_matting_base_size=1000,
+):
+    if alpha_matting:
+        return alpha_matting_cutout(
+            img,
+            mask,
+            alpha_matting_foreground_threshold,
+            alpha_matting_background_threshold,
+            alpha_matting_erode_structure_size,
+            alpha_matting_base_size,
+        )
+    return naive_cutout(img, mask)
+
+
+def create_sprite_kit(
+    data,
+    destination_dir,
+    prefix,
+    model_name="u2net",
+    alpha_matting=False,
+    alpha_matting_foreground_threshold=240,
+    alpha_matting_background_threshold=10,
+    alpha_matting_erode_structure_size=10,
+    alpha_matting_base_size=1000,
+    mask_threshold=128,
+    merge_distance=None,
+    min_sprite_area=None,
+):
+    """Remove the background, split the remaining foreground, and export sprite files."""
+    model = get_model(model_name)
+    img = _load_image(data)
+    mask = detect.predict(model, np.array(img)).convert("L")
+    hardened_mask = harden_sprite_mask(mask, threshold=mask_threshold)
+    cutout = _mask_to_cutout(
+        img,
+        hardened_mask,
+        alpha_matting=alpha_matting,
+        alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
+        alpha_matting_background_threshold=alpha_matting_background_threshold,
+        alpha_matting_erode_structure_size=alpha_matting_erode_structure_size,
+        alpha_matting_base_size=alpha_matting_base_size,
+    )
+    return export_sprite_kit(
+        cutout,
+        destination_dir=destination_dir,
+        prefix=prefix,
+        model_name=model_name,
+        merge_distance=merge_distance,
+        min_sprite_area=min_sprite_area,
+    )
+
+
 def remove(
     data,
     model_name="u2net",
@@ -262,17 +505,7 @@ def remove(
     mask_threshold=None,
 ):
     model = get_model(model_name)
-
-    if isinstance(data, np.ndarray):
-        img = Image.fromarray(data).convert("RGB")
-    else:
-        try:
-            img = Image.open(io.BytesIO(data))
-            # Handle EXIF orientation to prevent rotated images (fixes #144)
-            img = ImageOps.exif_transpose(img)
-            img = img.convert("RGB")
-        except Exception as e:
-            raise ValueError(f"Invalid image input to `remove()`: {e}")
+    img = _load_image(data)
 
     mask = detect.predict(model, np.array(img)).convert("L")
 
@@ -286,17 +519,15 @@ def remove(
         mask.save(bio, "PNG")
         return bio.getbuffer()
 
-    if alpha_matting:
-        cutout = alpha_matting_cutout(
-            img,
-            mask,
-            alpha_matting_foreground_threshold,
-            alpha_matting_background_threshold,
-            alpha_matting_erode_structure_size,
-            alpha_matting_base_size,
-        )
-    else:
-        cutout = naive_cutout(img, mask)
+    cutout = _mask_to_cutout(
+        img,
+        mask,
+        alpha_matting=alpha_matting,
+        alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
+        alpha_matting_background_threshold=alpha_matting_background_threshold,
+        alpha_matting_erode_structure_size=alpha_matting_erode_structure_size,
+        alpha_matting_base_size=alpha_matting_base_size,
+    )
 
     # If background_image is specified, composite over that image
     if background_image is not None:

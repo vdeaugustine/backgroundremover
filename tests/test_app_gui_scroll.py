@@ -107,6 +107,9 @@ class FrameSidebarScrollTests(unittest.TestCase):
 
         self.assertEqual(self.app.video_output_prefix.get(), "dog-run")
 
+    def test_image_auto_crop_toggle_defaults_on(self):
+        self.assertTrue(self.app.auto_crop_output.get())
+
     def test_frame_results_area_uses_resizable_paned_layout(self):
         self.assertTrue(hasattr(self.app, "frame_results_paned"))
         self.assertEqual(str(self.app.frame_results_paned.cget("orient")), "horizontal")
@@ -311,6 +314,52 @@ class VideoBackgroundCleanupPipelineTests(unittest.TestCase):
             self.assertEqual(saved_image.getpixel((0, 0)), (255, 0, 0, 255))
             self.assertEqual(saved_image.getpixel((1, 0))[3], 0)
             self.assertEqual(saved_image.getpixel((2, 0))[3], 0)
+
+
+class ImageSpriteKitTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = BackgroundRemoverApp(self.root)
+        self.root.update_idletasks()
+
+    def tearDown(self):
+        try:
+            self.app.on_close()
+        except Exception:
+            self.root.destroy()
+
+    def test_sprite_output_dir_defaults_to_downloads(self):
+        self.assertTrue(self.app.sprite_output_dir.get().endswith("Downloads"))
+
+    def test_sprite_kit_thread_uses_shared_export_pipeline(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = os.path.join(temp_dir, "Items.png")
+            Image.new("RGB", (6, 6), (255, 255, 255)).save(source_path, "PNG")
+
+            self.app.input_file.set(source_path)
+
+            saved_payload = {}
+            export_result = {
+                "sprite_count": 2,
+                "manifest_path": os.path.join(temp_dir, "Items_sprite_manifest.json"),
+                "sprites": [
+                    {"filename": "Items_sprite_001.png"},
+                    {"filename": "Items_sprite_002.png"},
+                ],
+            }
+
+            with mock.patch("app_gui.bg.create_sprite_kit", return_value=export_result) as create_sprite_kit, \
+                 mock.patch.object(self.app.root, "after", side_effect=lambda _delay, callback: callback()), \
+                 mock.patch.object(self.app, "_on_sprite_kit_success", side_effect=lambda result, target_dir: saved_payload.update({"result": result, "target_dir": target_dir})):
+                self.app._process_sprite_kit_thread(temp_dir)
+
+            create_sprite_kit.assert_called_once()
+            self.assertEqual(create_sprite_kit.call_args.kwargs["destination_dir"], temp_dir)
+            self.assertEqual(create_sprite_kit.call_args.kwargs["prefix"], "Items")
+            self.assertEqual(create_sprite_kit.call_args.kwargs["model_name"], self.app.model_choice.get())
+            self.assertEqual(saved_payload["result"]["sprite_count"], 2)
+            self.assertEqual(saved_payload["target_dir"], temp_dir)
 
 
 if __name__ == "__main__":

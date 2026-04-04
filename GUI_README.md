@@ -12,6 +12,7 @@ A simple and user-friendly graphical interface for removing backgrounds from ima
 - **Custom Export Prefixes**: Name saved outputs with your own prefix such as `dog_1`, `dog_2`, and so on
 - **Multiple Model Support**: Choose between different AI models (u2net, u2netp, u2net_human_seg)
 - **Alpha Matting**: Optional high-quality background removal with alpha matting
+- **Auto Crop To Content**: Optionally trim transparent outer space so the saved image hugs the subject
 - **Live Preview**: See input and output images side by side
 - **Progress Indication**: Visual feedback during processing
 - **Auto Output Naming**: Automatically suggests output filenames
@@ -51,7 +52,11 @@ Double-click `run_gui.bat` or run it from command prompt.
    - Check "Use Alpha Matting" for higher quality results
    - Takes longer but produces better edge quality
 
-6. **Process the Image**
+6. **Auto Crop To Content (Optional)**
+   - Enabled by default on the image tab
+   - Uncheck it if you want to preserve the original canvas size
+
+7. **Process the Image**
    - Click "Remove Background"
    - Wait for processing to complete
    - The output preview will show the result
