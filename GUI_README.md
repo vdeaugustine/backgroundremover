@@ -13,6 +13,7 @@ A simple and user-friendly graphical interface for removing backgrounds from ima
 - **Multiple Model Support**: Choose between different AI models (u2net, u2netp, u2net_human_seg)
 - **Alpha Matting**: Optional high-quality background removal with alpha matting
 - **Auto Crop To Content**: Optionally trim transparent outer space so the saved image hugs the subject
+- **Final Color Cleanup**: Sample or choose leftover background colors and make matching pixels transparent before saving
 - **Live Preview**: See input and output images side by side
 - **Progress Indication**: Visual feedback during processing
 - **Auto Output Naming**: Automatically suggests output filenames
@@ -56,7 +57,11 @@ Double-click `run_gui.bat` or run it from command prompt.
    - Enabled by default on the image tab
    - Uncheck it if you want to preserve the original canvas size
 
-7. **Process the Image**
+7. **Final Color Cleanup (Optional)**
+   - Sample a color from the input preview, click the color picker, or add one manually
+   - Matching pixels are removed before the final PNG is saved
+
+8. **Process the Image**
    - Click "Remove Background"
    - Wait for processing to complete
    - The output preview will show the result
@@ -71,8 +76,9 @@ Double-click `run_gui.bat` or run it from command prompt.
 6. Adjust the **Duplicate Threshold** slider if you want duplicate removal to be stricter or looser
 7. Click **Remove Duplicates** to keep only visually unique frames, and adjust the threshold and run it again if you do not like the result
 8. Review frames in the left sidebar and check the ones you want to keep
-9. Click **Save Selected** to export the original frames, or **Remove Background + Save** to export tightly cropped transparent PNG cutouts
-10. Use the attached disclosure button if you want to adjust the AI model or alpha-matting settings before batch removal
+9. Use **Final Color Cleanup** there too if you want to sample or choose leftover background colors before saving
+10. Click **Save Selected** to export the original frames, or **Remove Background + Save** to export tightly cropped transparent PNG cutouts
+11. Use the attached disclosure button if you want to adjust the AI model or alpha-matting settings before batch removal
 
 ## Supported File Formats
 

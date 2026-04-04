@@ -257,6 +257,7 @@ class BackgroundRemoverApp:
         self.model_choice = tk.StringVar(value="u2net")
         self.alpha_matting = tk.BooleanVar(value=False)
         self.auto_crop_output = tk.BooleanVar(value=True)
+        self.image_cleanup_threshold = tk.IntVar(value=COLOR_CLEANUP_THRESHOLD_DEFAULT)
         self.processing = False
         self.video_processing = False
         
@@ -285,6 +286,8 @@ class BackgroundRemoverApp:
         self.video_cleanup_threshold = tk.IntVar(value=COLOR_CLEANUP_THRESHOLD_DEFAULT)
         self.video_cleanup_colors = []
         self.preview_color_pick_active = False
+        self.image_cleanup_colors = []
+        self.image_preview_color_pick_active = False
         
         # Configure styles
         self.setup_styles()
@@ -519,6 +522,85 @@ class BackgroundRemoverApp:
                                    padx=5,
                                    font=ModernStyle.FONT_BODY)
         crop_check.pack(anchor=tk.W, pady=(8, 0))
+
+        image_cleanup_frame = ttk.Frame(options_frame)
+        image_cleanup_frame.pack(fill=tk.X, pady=(15, 0))
+
+        image_cleanup_header = ttk.Frame(image_cleanup_frame)
+        image_cleanup_header.pack(fill=tk.X)
+        ttk.Label(image_cleanup_header, text="Final Color Cleanup").pack(side=tk.LEFT)
+        self.image_cleanup_threshold_value_label = ttk.Label(
+            image_cleanup_header,
+            text=str(self.image_cleanup_threshold.get()),
+            style='Small.TLabel',
+        )
+        self.image_cleanup_threshold_value_label.pack(side=tk.RIGHT)
+
+        self.image_cleanup_threshold_scale = tk.Scale(
+            image_cleanup_frame,
+            from_=COLOR_CLEANUP_THRESHOLD_MIN,
+            to=COLOR_CLEANUP_THRESHOLD_MAX,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=self.image_cleanup_threshold,
+            command=self._on_image_cleanup_threshold_change,
+            bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            troughcolor=ModernStyle.BG_TERTIARY,
+            activebackground=ModernStyle.ACCENT,
+            highlightthickness=0,
+            font=ModernStyle.FONT_SMALL,
+        )
+        self.image_cleanup_threshold_scale.pack(fill=tk.X, pady=(5, 0))
+
+        ttk.Label(
+            image_cleanup_frame,
+            text="Sample leftover background colors from the input preview or add one manually. Matching pixels become transparent before save.",
+            style='Small.TLabel',
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+        image_cleanup_button_row = ttk.Frame(image_cleanup_frame)
+        image_cleanup_button_row.pack(fill=tk.X, pady=(10, 8))
+
+        self.pick_image_cleanup_color_btn = RoundedButton(
+            image_cleanup_button_row,
+            text="Sample From Input",
+            command=self._toggle_image_preview_color_pick,
+            width=180,
+            height=38,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.pick_image_cleanup_color_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.add_image_cleanup_color_btn = RoundedButton(
+            image_cleanup_button_row,
+            text="Add Color...",
+            command=self._choose_image_cleanup_color,
+            width=140,
+            height=38,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.add_image_cleanup_color_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.clear_image_cleanup_colors_btn = RoundedButton(
+            image_cleanup_button_row,
+            text="Clear Colors",
+            command=self._clear_image_cleanup_colors,
+            width=130,
+            height=38,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.clear_image_cleanup_colors_btn.pack(side=tk.LEFT)
+
+        self.image_cleanup_colors_label = ttk.Label(
+            image_cleanup_frame,
+            text="No cleanup colors selected.",
+            style='Small.TLabel',
+        )
+        self.image_cleanup_colors_label.pack(anchor=tk.W)
         
         # Process button
         self.process_btn = RoundedButton(parent, text="Remove Background",
@@ -569,6 +651,7 @@ class BackgroundRemoverApp:
                                      fg=ModernStyle.TEXT_SECONDARY,
                                      font=ModernStyle.FONT_SMALL)
         self.input_preview.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.input_preview.bind("<Button-1>", self._on_input_preview_click)
         
         # Output preview
         output_preview_frame = tk.Frame(preview_frame, bg=ModernStyle.BG_SECONDARY)
@@ -584,6 +667,7 @@ class BackgroundRemoverApp:
                                       fg=ModernStyle.TEXT_SECONDARY,
                                       font=ModernStyle.FONT_SMALL)
         self.output_preview.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self._refresh_image_cleanup_controls()
 
     def create_video_tab(self, parent):
         """Create the video frame extraction tab"""
@@ -1961,6 +2045,108 @@ class BackgroundRemoverApp:
             foreground=ModernStyle.ERROR,
         )
         messagebox.showerror("Error", f"Failed to remove backgrounds from selected frames:\n\n{error_msg}")
+
+    def _image_cleanup_colors_summary(self):
+        if not self.image_cleanup_colors:
+            return "None selected"
+
+        swatches = [format_rgb_color(color) for color in self.image_cleanup_colors[:4]]
+        if len(self.image_cleanup_colors) > 4:
+            swatches.append(f"+{len(self.image_cleanup_colors) - 4} more")
+        return ", ".join(swatches)
+
+    def _refresh_image_cleanup_controls(self):
+        if getattr(self, "pick_image_cleanup_color_btn", None) is None:
+            return
+
+        if self.image_preview_color_pick_active:
+            self.pick_image_cleanup_color_btn.set_text("Click Input To Sample")
+            self.input_preview.configure(cursor="crosshair")
+        else:
+            self.pick_image_cleanup_color_btn.set_text("Sample From Input")
+            self.input_preview.configure(cursor="")
+
+        self.image_cleanup_colors_label.configure(
+            text=(
+                f"Cleanup colors: {self._image_cleanup_colors_summary()}. "
+                f"Tolerance: {self.image_cleanup_threshold.get()}"
+            )
+        )
+
+        has_input = bool(self.input_file.get()) and os.path.exists(self.input_file.get())
+        if self.processing:
+            self.pick_image_cleanup_color_btn.configure_state("disabled")
+            self.add_image_cleanup_color_btn.configure_state("disabled")
+            self.clear_image_cleanup_colors_btn.configure_state("disabled")
+            return
+
+        self.pick_image_cleanup_color_btn.configure_state("normal" if has_input else "disabled")
+        self.add_image_cleanup_color_btn.configure_state("normal")
+        self.clear_image_cleanup_colors_btn.configure_state("normal" if self.image_cleanup_colors else "disabled")
+
+    def _on_image_cleanup_threshold_change(self, _value):
+        self.image_cleanup_threshold_value_label.configure(text=str(self.image_cleanup_threshold.get()))
+        self._refresh_image_cleanup_controls()
+
+    def _toggle_image_preview_color_pick(self):
+        if not self.input_file.get() or not os.path.exists(self.input_file.get()) or self.input_photo is None:
+            messagebox.showerror("Error", "Select an input image before sampling a cleanup color.")
+            return
+
+        self.image_preview_color_pick_active = not self.image_preview_color_pick_active
+        self._refresh_image_cleanup_controls()
+
+    def _choose_image_cleanup_color(self):
+        chosen, hex_color = colorchooser.askcolor(
+            title="Choose Cleanup Color",
+            parent=self.root,
+        )
+        if chosen is None or hex_color is None:
+            return
+
+        color = tuple(int(round(channel)) for channel in chosen[:3])
+        self._add_image_cleanup_color(color)
+
+    def _add_image_cleanup_color(self, color):
+        normalized_color = tuple(max(0, min(255, int(channel))) for channel in color[:3])
+        if normalized_color not in self.image_cleanup_colors:
+            self.image_cleanup_colors.append(normalized_color)
+
+        self.image_preview_color_pick_active = False
+        self._refresh_image_cleanup_controls()
+
+    def _clear_image_cleanup_colors(self):
+        self.image_cleanup_colors = []
+        self.image_preview_color_pick_active = False
+        self._refresh_image_cleanup_controls()
+
+    def _on_input_preview_click(self, event):
+        if not self.image_preview_color_pick_active or not self.input_file.get() or self.input_photo is None:
+            return
+
+        display_width = self.input_photo.width()
+        display_height = self.input_photo.height()
+        widget_width = max(self.input_preview.winfo_width(), display_width)
+        widget_height = max(self.input_preview.winfo_height(), display_height)
+        x_offset = max((widget_width - display_width) // 2, 0)
+        y_offset = max((widget_height - display_height) // 2, 0)
+
+        local_x = event.x - x_offset
+        local_y = event.y - y_offset
+        if local_x < 0 or local_y < 0 or local_x >= display_width or local_y >= display_height:
+            return
+
+        with Image.open(self.input_file.get()) as opened_image:
+            source_image = opened_image.convert("RGB")
+            source_x = min(source_image.width - 1, max(0, int(local_x * source_image.width / display_width)))
+            source_y = min(source_image.height - 1, max(0, int(local_y * source_image.height / display_height)))
+            sampled_color = source_image.getpixel((source_x, source_y))
+
+        self._add_image_cleanup_color(sampled_color)
+        self.status_label.configure(
+            text=f"Added cleanup color {format_rgb_color(sampled_color)}. Matching pixels will be removed before save.",
+            foreground=ModernStyle.SUCCESS,
+        )
     
     def browse_input(self):
         """Open file dialog for input image"""
@@ -2019,6 +2205,7 @@ class BackgroundRemoverApp:
             
             self.input_photo = ImageTk.PhotoImage(image)
             self.input_preview.configure(image=self.input_photo, text="")
+            self._refresh_image_cleanup_controls()
         except Exception as e:
             self.input_preview.configure(image="", text=f"Error: {str(e)[:30]}...")
     
@@ -2242,6 +2429,11 @@ class BackgroundRemoverApp:
             net = self._load_model(self.model_choice.get())
             
             cutout = self._create_cutout_for_image(img, net, self.alpha_matting.get())
+            cutout = apply_color_cleanup(
+                cutout,
+                self.image_cleanup_colors,
+                self.image_cleanup_threshold.get(),
+            )
             if self.auto_crop_output.get():
                 cutout = crop_to_visible_bounds(cutout)
             
@@ -2281,6 +2473,7 @@ class BackgroundRemoverApp:
         self.progress.stop()
         self.process_btn.configure_state("normal")
         self.sprite_process_btn.configure_state("normal")
+        self._refresh_image_cleanup_controls()
         self.status_label.configure(text="✓ Background removed successfully!", foreground=ModernStyle.SUCCESS)
         
         self.load_output_preview(self.output_file.get())
@@ -2318,6 +2511,7 @@ class BackgroundRemoverApp:
         self.progress.stop()
         self.process_btn.configure_state("normal")
         self.sprite_process_btn.configure_state("normal")
+        self._refresh_image_cleanup_controls()
         self.status_label.configure(text="✗ Processing failed", foreground=ModernStyle.ERROR)
         
         messagebox.showerror("Error", f"Failed to process image:\n\n{error_msg}")

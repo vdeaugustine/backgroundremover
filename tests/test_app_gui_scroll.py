@@ -110,6 +110,10 @@ class FrameSidebarScrollTests(unittest.TestCase):
     def test_image_auto_crop_toggle_defaults_on(self):
         self.assertTrue(self.app.auto_crop_output.get())
 
+    def test_image_cleanup_controls_start_disabled_without_input(self):
+        self.assertTrue(self.app.pick_image_cleanup_color_btn._disabled)
+        self.assertFalse(self.app.add_image_cleanup_color_btn._disabled)
+
     def test_frame_results_area_uses_resizable_paned_layout(self):
         self.assertTrue(hasattr(self.app, "frame_results_paned"))
         self.assertEqual(str(self.app.frame_results_paned.cget("orient")), "horizontal")
@@ -309,6 +313,50 @@ class VideoBackgroundCleanupPipelineTests(unittest.TestCase):
                 )
 
             with Image.open(saved_payload["paths"][0]) as saved_image_file:
+                saved_image = saved_image_file.convert("RGBA")
+
+            self.assertEqual(saved_image.getpixel((0, 0)), (255, 0, 0, 255))
+            self.assertEqual(saved_image.getpixel((1, 0))[3], 0)
+            self.assertEqual(saved_image.getpixel((2, 0))[3], 0)
+
+
+class ImageBackgroundCleanupPipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = BackgroundRemoverApp(self.root)
+        self.root.update_idletasks()
+
+    def tearDown(self):
+        try:
+            self.app.on_close()
+        except Exception:
+            self.root.destroy()
+
+    def test_image_export_applies_selected_color_cleanup_before_save(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = os.path.join(temp_dir, "input.png")
+            output_path = os.path.join(temp_dir, "output.png")
+            Image.new("RGB", (4, 4), (255, 255, 255)).save(source_path, "PNG")
+
+            self.app.input_file.set(source_path)
+            self.app.output_file.set(output_path)
+            self.app.auto_crop_output.set(False)
+            self.app.image_cleanup_colors = [(0, 255, 0)]
+            self.app.image_cleanup_threshold.set(15)
+
+            cutout = Image.new("RGBA", (4, 4), (0, 0, 0, 0))
+            cutout.putpixel((0, 0), (255, 0, 0, 255))
+            cutout.putpixel((1, 0), (0, 255, 0, 255))
+            cutout.putpixel((2, 0), (4, 248, 8, 255))
+
+            with mock.patch.object(self.app, "_load_model", return_value=mock.sentinel.net), \
+                 mock.patch.object(self.app, "_create_cutout_for_image", return_value=cutout.copy()), \
+                 mock.patch.object(self.app.root, "after", side_effect=lambda _delay, callback: callback()), \
+                 mock.patch.object(self.app, "_on_success"):
+                self.app._process_thread()
+
+            with Image.open(output_path) as saved_image_file:
                 saved_image = saved_image_file.convert("RGBA")
 
             self.assertEqual(saved_image.getpixel((0, 0)), (255, 0, 0, 255))
