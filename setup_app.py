@@ -12,10 +12,14 @@ import os
 import sys
 
 # Ensure we're in the right directory
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+os.chdir(_REPO_ROOT)
 
 APP = ['app_gui.py']
 APP_NAME = 'Background Remover'
+
+_ICNS_PATH = os.path.join(_REPO_ROOT, 'BackgroundRemover.icns')
+_WINDOW_ICON_PNG = os.path.join(_REPO_ROOT, 'app_window_icon.png')
 
 DATA_FILES = [
     # Include the backgroundremover package
@@ -23,7 +27,7 @@ DATA_FILES = [
 
 OPTIONS = {
     'argv_emulation': False,
-    'iconfile': None,  # Will create an icon
+    'iconfile': _ICNS_PATH if os.path.isfile(_ICNS_PATH) else None,
     'plist': {
         'CFBundleName': APP_NAME,
         'CFBundleDisplayName': APP_NAME,
@@ -79,7 +83,7 @@ OPTIONS = {
         'tests',
         'unittest',
     ],
-    'resources': [],
+    'resources': ['app_window_icon.png'] if os.path.isfile(_WINDOW_ICON_PNG) else [],
     'semi_standalone': False,
     'site_packages': True,
 }

@@ -65,6 +65,34 @@ except Exception:
     DEVICE_NAME = "CPU"
 
 
+def _resolve_window_icon_png_path():
+    """Path to app_window_icon.png in dev tree or inside a py2app bundle Resources folder."""
+    if getattr(sys, "frozen", False):
+        contents_dir = os.path.dirname(os.path.dirname(sys.executable))
+        bundled = os.path.join(contents_dir, "Resources", "app_window_icon.png")
+        if os.path.isfile(bundled):
+            return bundled
+    dev_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_window_icon.png")
+    return dev_path if os.path.isfile(dev_path) else None
+
+
+def apply_window_icon(root):
+    """
+    Set the Tk window icon where supported. The Dock and Finder icon for the distributed
+    .app comes from BackgroundRemover.icns via py2app; this PNG keeps the title bar consistent.
+    """
+    path = _resolve_window_icon_png_path()
+    if not path:
+        return
+    try:
+        icon_image = Image.open(path)
+        photo = ImageTk.PhotoImage(icon_image)
+        root.iconphoto(True, photo)
+        root._wm_icon_photo_ref = photo
+    except Exception:
+        pass
+
+
 def build_frame_similarity_signature(image, size=DUPLICATE_FRAME_SIGNATURE_SIZE):
     """Create a small normalized grayscale representation for frame comparison."""
     grayscale = image.convert("L").resize(size, Image.Resampling.BILINEAR)
@@ -3160,6 +3188,7 @@ class BackgroundRemoverApp:
 def main():
     """Main entry point"""
     root = tk.Tk()
+    apply_window_icon(root)
     app = BackgroundRemoverApp(root)
     root.mainloop()
 
