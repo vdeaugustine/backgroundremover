@@ -131,11 +131,20 @@ def build_export_filename(prefix, sequence_number, suffix=""):
     return f"{prefix}_{sequence_number}{suffix}.png"
 
 
-def crop_to_visible_bounds(image):
+def crop_to_visible_bounds(image, padding=0):
     """Crop transparent outer bounds from an RGBA image, if any visible pixels exist."""
     bbox = image.getbbox()
     if bbox is None:
         return image
+    
+    if padding > 0:
+        left, top, right, bottom = bbox
+        left = max(0, left - padding)
+        top = max(0, top - padding)
+        right = min(image.width, right + padding)
+        bottom = min(image.height, bottom + padding)
+        bbox = (left, top, right, bottom)
+        
     return image.crop(bbox)
 
 
@@ -195,11 +204,11 @@ def resolve_color_cleanup_worker_count(frame_count):
     return max(1, min(MAX_COLOR_CLEANUP_WORKERS, available_cpus, int(frame_count or 1)))
 
 
-def finalize_processed_cutout(cutout, destination, cleanup_colors, cleanup_threshold, exact_colors=None, auto_crop=True, target_size=None):
+def finalize_processed_cutout(cutout, destination, cleanup_colors, cleanup_threshold, exact_colors=None, auto_crop=True, target_size=None, crop_padding=0):
     """Run the final cleanup pass, crop, resize and save one processed frame."""
     finalized = apply_color_cleanup(cutout, cleanup_colors or [], cleanup_threshold, exact_colors or [])
     if auto_crop:
-        finalized = crop_to_visible_bounds(finalized)
+        finalized = crop_to_visible_bounds(finalized, padding=crop_padding)
     if target_size and target_size[0] > 0 and target_size[1] > 0:
         target_width, target_height = target_size
         img_width, img_height = finalized.size
@@ -376,12 +385,11 @@ class BackgroundRemoverApp:
         self.video_clip_metadata = {}
         self.full_frame_count = 0
         self.all_extracted_frame_items = []
-        # Snapshot of frame_items captured just before 'Remove Duplicates' runs,
-        # enabling a single-level undo back to the pre-dedupe state.
-        self._pre_dedupe_frame_snapshot = None
+        self._video_edit_history = []
         self.video_bg_model_choice = tk.StringVar(value="u2net")
         self.video_bg_alpha_matting = tk.BooleanVar(value=False)
         self.video_bg_auto_crop = tk.BooleanVar(value=True)
+        self.video_bg_crop_padding = tk.IntVar(value=0)
         self.video_export_width = tk.StringVar(value="")
         self.video_export_height = tk.StringVar(value="")
 
@@ -481,16 +489,16 @@ class BackgroundRemoverApp:
         self.app_shell.bind_all("<Button-4>", self._on_app_mousewheel, add="+")
         self.app_shell.bind_all("<Button-5>", self._on_app_mousewheel, add="+")
 
-        notebook = ttk.Notebook(self.app_content)
-        notebook.pack(fill=tk.BOTH, expand=True)
+        self.notebook = ttk.Notebook(self.app_content)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        image_tab = ttk.Frame(notebook, padding="20")
-        video_tab = ttk.Frame(notebook, padding="20")
-        notebook.add(image_tab, text="Background Remover")
-        notebook.add(video_tab, text="Video Frames")
+        image_tab = ttk.Frame(self.notebook, padding="20")
+        self.video_tab = ttk.Frame(self.notebook, padding="20")
+        self.notebook.add(image_tab, text="Background Remover")
+        self.notebook.add(self.video_tab, text="Video Frames")
 
         self.create_image_tab(image_tab)
-        self.create_video_tab(video_tab)
+        self.create_video_tab(self.video_tab)
 
     def create_image_tab(self, parent):
         """Create the image background removal tab"""
@@ -1155,7 +1163,7 @@ class BackgroundRemoverApp:
 
         self.undo_remove_duplicates_btn = RoundedButton(
             toolbar_inner, text="Undo",
-            command=self.undo_remove_duplicate_frames,
+            command=self.undo_last_video_edit,
             width=52, height=28,
             bg=ModernStyle.BG_TERTIARY, hover_bg=ModernStyle.BORDER,
             font=ModernStyle.FONT_SMALL,
@@ -1908,7 +1916,7 @@ class BackgroundRemoverApp:
         self.full_frame_count = 0
         self.current_frame_index = None
         self.frame_preview_photo = None
-        self._pre_dedupe_frame_snapshot = None
+        self._video_edit_history = []
         self._clear_frame_preview_canvas("Extract frames to start reviewing them")
         self.frame_preview_meta.configure(text="")
         self._update_sidebar_counts()
@@ -2066,7 +2074,7 @@ class BackgroundRemoverApp:
             # Preserve existing selection when the caller asks for it
             # (e.g. after color cleanup or background removal).
             existing_var = item.get("selected_var")
-            was_selected = existing_var.get() if existing_var is not None else False
+            was_selected = existing_var.get() if existing_var is not None else bool(item.get("_selected", False))
             initial_value = was_selected if preserve_selection else False
             frame_item["selected_var"] = tk.BooleanVar(value=initial_value)
             frame_item["widget"] = None
@@ -2100,11 +2108,11 @@ class BackgroundRemoverApp:
         self.extract_frames_btn.configure_state("normal")
         has_frames = bool(self.frame_items)
         has_selected_frames = has_frames and self._selected_frame_count() > 0
-        can_undo_dedupe = self._pre_dedupe_frame_snapshot is not None
+        can_undo_video_edit = bool(self._video_edit_history)
         can_dedupe = len(self.all_extracted_frame_items) > 1 or len(self.frame_items) > 1
         self.select_all_btn.configure_state("normal" if has_frames else "disabled")
         self.remove_duplicates_btn.configure_state("normal" if can_dedupe else "disabled")
-        self.undo_remove_duplicates_btn.configure_state("normal" if can_undo_dedupe else "disabled")
+        self.undo_remove_duplicates_btn.configure_state("normal" if can_undo_video_edit else "disabled")
         self.clear_selection_btn.configure_state("normal" if has_frames else "disabled")
         self.save_frames_btn.configure_state("normal" if has_selected_frames else "disabled")
         self.remove_bg_frames_btn.configure_state("normal" if has_selected_frames else "disabled")
@@ -2265,6 +2273,49 @@ class BackgroundRemoverApp:
     def _current_frame_item(self):
         return next((item for item in self.frame_items if item["index"] == self.current_frame_index), None)
 
+    def _snapshot_video_frame_items(self):
+        snapshot = []
+        for item in self.frame_items:
+            snapshot_item = {
+                key: value
+                for key, value in item.items()
+                if key not in {"selected_var", "widget", "thumbnail_photo"}
+            }
+            selected_var = item.get("selected_var")
+            snapshot_item["_selected"] = selected_var.get() if selected_var is not None else bool(item.get("_selected", False))
+            snapshot.append(snapshot_item)
+        return snapshot
+
+    def _push_video_edit_history(self, action_name):
+        if not self.frame_items:
+            return
+
+        self._video_edit_history.append(
+            {
+                "action_name": action_name,
+                "frame_items": self._snapshot_video_frame_items(),
+                "current_frame_index": self.current_frame_index,
+            }
+        )
+
+        if len(self._video_edit_history) > 50:
+            self._video_edit_history.pop(0)
+
+    def _video_tab_is_active(self):
+        if not hasattr(self, "notebook") or not hasattr(self, "video_tab"):
+            return False
+        return self.notebook.select() == str(self.video_tab)
+
+    def _handle_video_undo_shortcut(self, event=None):
+        if not self._video_tab_is_active():
+            return None
+
+        focused_widget = self.root.focus_get()
+        if focused_widget is not None and focused_widget.winfo_class() in {"Entry", "TEntry", "Text", "Spinbox", "TCombobox"}:
+            return None
+
+        return self.undo_last_video_edit(event)
+
     def _select_frame_by_index(self, target_index):
         matching = next((item for item in self.frame_items if item["index"] == target_index), None)
         if matching is None:
@@ -2298,6 +2349,10 @@ class BackgroundRemoverApp:
     def _bind_frame_navigation(self):
         self.root.bind_all("<Up>", self.select_previous_frame, add="+")
         self.root.bind_all("<Down>", self.select_next_frame, add="+")
+        self.root.bind_all("<Command-z>", self._handle_video_undo_shortcut, add="+")
+        self.root.bind_all("<Command-Z>", self._handle_video_undo_shortcut, add="+")
+        self.root.bind_all("<Control-z>", self._handle_video_undo_shortcut, add="+")
+        self.root.bind_all("<Control-Z>", self._handle_video_undo_shortcut, add="+")
 
     def _on_frame_preview_click(self, event):
         is_threshold_pick = self.preview_color_pick_active
@@ -2348,8 +2403,7 @@ class BackgroundRemoverApp:
         if len(self.all_extracted_frame_items) <= 1 or self.video_processing:
             return
 
-        # Capture current full frame list so the user can undo this operation.
-        self._pre_dedupe_frame_snapshot = [dict(item) for item in self.frame_items]
+        self._push_video_edit_history("remove duplicates")
 
         self.video_processing = True
         self._set_video_action_states(is_busy=True)
@@ -2387,7 +2441,7 @@ class BackgroundRemoverApp:
             text=(
                 f"{self.full_frame_count} frames extracted, {len(self.frame_items)} unique frames kept "
                 f"({removed_count} removed) at threshold {self.deduplication_threshold.get():.3f}. "
-                f"Use \"Undo Dedupe\" to restore all frames."
+                f"Use Undo or Cmd+Z to restore the previous step."
             ),
             foreground=ModernStyle.SUCCESS,
         )
@@ -2398,8 +2452,8 @@ class BackgroundRemoverApp:
         """Handle duplicate-removal failure without losing extracted frames."""
         self.video_processing = False
         self.video_progress.stop()
-        # Discard the snapshot that was captured before the failed run.
-        self._pre_dedupe_frame_snapshot = None
+        if self._video_edit_history and self._video_edit_history[-1]["action_name"] == "remove duplicates":
+            self._video_edit_history.pop()
         self._set_video_action_states(is_busy=False)
         self.video_status_label.configure(
             text="Removing duplicate frames failed.",
@@ -2408,18 +2462,26 @@ class BackgroundRemoverApp:
         messagebox.showerror("Error", f"Failed to remove duplicate frames:\n\n{error_msg}")
 
     def undo_remove_duplicate_frames(self):
-        """Restore the frame list to the state it was in before the last Remove Duplicates run."""
-        if self._pre_dedupe_frame_snapshot is None or self.video_processing:
-            return
+        """Backward-compatible alias for the shared video undo action."""
+        return self.undo_last_video_edit()
 
-        snapshot = self._pre_dedupe_frame_snapshot
-        self._pre_dedupe_frame_snapshot = None
-        self._rebuild_frame_list(snapshot)
+    def undo_last_video_edit(self, _event=None):
+        """Restore the frame list to the state it was in before the last video edit step."""
+        if not self._video_edit_history or self.video_processing:
+            return "break"
+
+        snapshot = self._video_edit_history.pop()
+        self._rebuild_frame_list(snapshot["frame_items"], preserve_selection=True)
+        target_index = snapshot.get("current_frame_index")
+        if target_index is not None:
+            self._select_frame_by_index(target_index)
+
         self.video_status_label.configure(
-            text=f"Restore complete: showing all {len(self.frame_items)} frames.",
+            text=f"Undo complete: restored the state before {snapshot['action_name']}.",
             foreground=ModernStyle.SUCCESS,
         )
         self._set_video_action_states(is_busy=False)
+        return "break"
 
     def _add_frame_thumbnail(self, frame_item):
         """Create a single clickable frame thumbnail row"""
@@ -2655,7 +2717,35 @@ class BackgroundRemoverApp:
             activeforeground=ModernStyle.ACCENT,
             font=ModernStyle.FONT_BODY,
             padx=5,
-        ).pack(anchor=tk.W, pady=(0, 20))
+        ).pack(anchor=tk.W, pady=(0, 5))
+
+        padding_frame = ttk.Frame(container)
+        padding_frame.pack(fill=tk.X, pady=(0, 20))
+        
+        ttk.Label(padding_frame, text="Crop Padding (px):").pack(side=tk.LEFT)
+        padding_val_label = ttk.Label(padding_frame, text=str(self.video_bg_crop_padding.get()), style='Small.TLabel')
+        padding_val_label.pack(side=tk.RIGHT)
+        
+        padding_var = tk.IntVar(value=self.video_bg_crop_padding.get())
+        
+        def update_padding_label(val):
+            padding_val_label.configure(text=str(int(float(val))))
+
+        tk.Scale(
+            padding_frame,
+            from_=0,
+            to=100,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=padding_var,
+            command=update_padding_label,
+            bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            troughcolor=ModernStyle.BG_TERTIARY,
+            activebackground=ModernStyle.ACCENT,
+            highlightthickness=0,
+            font=ModernStyle.FONT_SMALL,
+        ).pack(fill=tk.X, pady=(5, 0))
 
         button_row = ttk.Frame(container)
         button_row.pack(fill=tk.X)
@@ -2664,6 +2754,7 @@ class BackgroundRemoverApp:
             self.video_bg_model_choice.set(model_var.get())
             self.video_bg_alpha_matting.set(alpha_var.get())
             self.video_bg_auto_crop.set(crop_var.get())
+            self.video_bg_crop_padding.set(padding_var.get())
             dialog.destroy()
             self.remove_background_and_save_selected_frames()
 
@@ -2715,6 +2806,8 @@ class BackgroundRemoverApp:
         if self.video_processing:
             return
 
+        action_name = "background removal" if action == "remove_background" else "color cleanup"
+        self._push_video_edit_history(action_name)
         self.video_processing = True
         self.video_progress.start(10)
         self._set_video_action_states(is_busy=True)
@@ -2735,7 +2828,8 @@ class BackgroundRemoverApp:
                 list(self.video_cleanup_colors),
                 self.video_cleanup_threshold.get(),
                 list(self.video_exact_cleanup_colors),
-                self.video_bg_auto_crop.get()
+                self.video_bg_auto_crop.get(),
+                self.video_bg_crop_padding.get()
             ),
             daemon=True,
         )
@@ -2754,7 +2848,7 @@ class BackgroundRemoverApp:
             position = pending_futures.pop(completed_future)
             saved_paths_by_position[position] = completed_future.result()
 
-    def _process_frames_inline_thread(self, selected_items, action, model_name, alpha_matting, cleanup_colors, cleanup_threshold, exact_colors, auto_crop):
+    def _process_frames_inline_thread(self, selected_items, action, model_name, alpha_matting, cleanup_colors, cleanup_threshold, exact_colors, auto_crop, crop_padding):
         """Process frames inline, updating them in temp directory."""
         import uuid
         try:
@@ -2820,7 +2914,8 @@ class BackgroundRemoverApp:
                         cleanup_threshold,
                         exacts,
                         auto_crop if action == "remove_background" else False,
-                        None  # Resize happens on "save selected"
+                        None,  # Resize happens on "save selected"
+                        crop_padding if action == "remove_background" else 0
                     )
                     pending_futures[future] = item
 
@@ -2912,6 +3007,114 @@ class BackgroundRemoverApp:
             foreground=ModernStyle.ERROR,
         )
         messagebox.showerror("Error", f"Failed to save selected frames:\n\n{error_msg}")
+    def remove_background_and_save_selected_frames(self):
+        """Batch remove backgrounds from selected frames and save them to output directory."""
+        if not self.frame_items:
+            messagebox.showerror("Error", "Extract frames before processing them.")
+            return
+
+        selected_items = [item for item in self.frame_items if item["selected_var"].get()]
+        if not selected_items:
+            messagebox.showerror("Error", "Select at least one frame to process.")
+            return
+
+        target_dir = self.frame_output_dir.get()
+        if not os.path.exists(target_dir):
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not create output directory:\n{e}")
+                return
+
+        # Get target size if specified
+        target_size = None
+        try:
+            w = self.video_export_width.get().strip()
+            h = self.video_export_height.get().strip()
+            if w and h:
+                target_size = (int(w), int(h))
+        except ValueError:
+            pass
+
+        self.video_processing = True
+        self.video_progress.start(10)
+        self._set_video_action_states(is_busy=True)
+        self.video_status_label.configure(
+            text=f"Removing backgrounds and saving {len(selected_items)} frame(s)...",
+            foreground=ModernStyle.TEXT_SECONDARY,
+        )
+
+        thread = threading.Thread(
+            target=self._remove_background_and_save_selected_frames_thread,
+            args=(
+                selected_items,
+                target_dir,
+                self.video_bg_model_choice.get(),
+                self.video_bg_alpha_matting.get(),
+                target_size,
+                self.video_bg_auto_crop.get(),
+                self.video_bg_crop_padding.get()
+            ),
+            daemon=True
+        )
+        thread.start()
+
+    def _remove_background_and_save_selected_frames_thread(self, selected_items, target_dir, model_name, alpha_matting, target_size, auto_crop, crop_padding):
+        """Worker thread for batch background removal and saving."""
+        try:
+            from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
+            net = self._load_model(model_name)
+            
+            # Warm up MPS
+            if DEVICE.type == "mps":
+                _dummy = Image.new("RGB", (64, 64), (128, 128, 128))
+                _ = self._predict(net, np.array(_dummy))
+                if hasattr(torch.mps, "synchronize"):
+                    torch.mps.synchronize()
+                del _dummy
+
+            worker_count = resolve_color_cleanup_worker_count(len(selected_items))
+            total = len(selected_items)
+            output_prefix = self._resolved_video_output_prefix()
+
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = []
+                for position, item in enumerate(selected_items, start=1):
+                    self.root.after(0, lambda p=position, t=total: self.video_status_label.configure(text=f"Removing background {p}/{t}..."))
+                    
+                    with Image.open(item["path"]) as opened_image:
+                        img = opened_image.convert("RGB")
+                    
+                    # AI removal mask
+                    mask_array = self._predict(net, np.array(img))
+                    mask = Image.fromarray(mask_array).convert("L")
+                    # Using global _mask_to_cutout
+                    cutout = _mask_to_cutout(img, mask, alpha_matting=alpha_matting)
+                    
+                    destination = os.path.join(target_dir, build_export_filename(output_prefix, position))
+                    
+                    # Finalize (includes crop)
+                    future = executor.submit(
+                        finalize_processed_cutout,
+                        cutout,
+                        destination,
+                        [], # cleanup_colors
+                        0,  # cleanup_threshold
+                        [], # exact_colors
+                        auto_crop,
+                        target_size,
+                        crop_padding
+                    )
+                    futures.append(future)
+
+                wait(futures, return_when=ALL_COMPLETED)
+                saved_paths = [f.result() for f in futures]
+
+            self.root.after(0, lambda: self._on_background_frames_saved(saved_paths, target_dir))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.root.after(0, lambda: self._on_background_frames_save_error(str(e)))
 
     def _on_background_frames_saved(self, saved_paths, target_dir):
         """Handle successful batch background removal for selected frames."""

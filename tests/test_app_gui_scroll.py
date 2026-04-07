@@ -319,6 +319,57 @@ class VideoBackgroundCleanupPipelineTests(unittest.TestCase):
             self.assertEqual(saved_image.getpixel((1, 0))[3], 0)
             self.assertEqual(saved_image.getpixel((2, 0))[3], 0)
 
+    def test_video_undo_restores_one_inline_processing_step_at_a_time(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_path = os.path.join(temp_dir, "frame-original.png")
+            step_two_path = os.path.join(temp_dir, "frame-step-two.png")
+            step_three_path = os.path.join(temp_dir, "frame-step-three.png")
+
+            Image.new("RGBA", (2, 2), (255, 0, 0, 255)).save(original_path, "PNG")
+            Image.new("RGBA", (2, 2), (0, 255, 0, 255)).save(step_two_path, "PNG")
+            Image.new("RGBA", (2, 2), (0, 0, 255, 255)).save(step_three_path, "PNG")
+
+            frame_items = [
+                {
+                    "index": 0,
+                    "name": "Frame 1",
+                    "path": original_path,
+                    "size": (2, 2),
+                    "thumbnail": mock.Mock(),
+                    "compare_array": np.zeros((2, 2), dtype=np.float32),
+                    "selected_var": tk.BooleanVar(value=True),
+                }
+            ]
+
+            class ImmediateThread:
+                def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+                    self.target = target
+                    self.args = args
+                    self.kwargs = kwargs or {}
+
+                def start(self):
+                    self.target(*self.args, **self.kwargs)
+
+            with mock.patch.object(self.app, "_add_frame_thumbnail"), \
+                 mock.patch.object(self.app, "_show_frame_preview"), \
+                 mock.patch.object(self.app.root, "after", side_effect=lambda _delay, callback: callback()):
+                self.app.frame_temp_dir = tempfile.TemporaryDirectory(dir=temp_dir)
+                self.app._rebuild_frame_list(frame_items, preserve_selection=True)
+
+                with mock.patch("app_gui.threading.Thread", side_effect=ImmediateThread), \
+                     mock.patch("app_gui.finalize_processed_cutout", side_effect=[step_two_path, step_three_path]):
+                    self.app.process_color_cleanup()
+                    self.assertEqual(self.app.frame_items[0]["path"], step_two_path)
+
+                    self.app.process_color_cleanup()
+                    self.assertEqual(self.app.frame_items[0]["path"], step_three_path)
+
+                self.app.undo_remove_duplicate_frames()
+                self.assertEqual(self.app.frame_items[0]["path"], step_two_path)
+
+                self.app.undo_remove_duplicate_frames()
+                self.assertEqual(self.app.frame_items[0]["path"], original_path)
+
 
 class ImageBackgroundCleanupPipelineTests(unittest.TestCase):
     def setUp(self):
