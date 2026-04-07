@@ -52,6 +52,7 @@ OPTIONS = {
         ],
     },
     'packages': [
+        'gui',
         'backgroundremover',
         'torch',
         'torchvision', 

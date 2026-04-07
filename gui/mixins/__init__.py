@@ -1,0 +1,1 @@
+"""Mixin package for BackgroundRemoverApp."""
