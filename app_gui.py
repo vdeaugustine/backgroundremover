@@ -30,6 +30,13 @@ COLOR_CLEANUP_THRESHOLD_MAX = 120
 COLOR_CLEANUP_THRESHOLD_DEFAULT = 15
 MAX_COLOR_CLEANUP_WORKERS = 4
 MAX_PENDING_COLOR_CLEANUP_TASKS_PER_WORKER = 2
+PROTECT_BRUSH_RADIUS_MIN = 2
+PROTECT_BRUSH_RADIUS_MAX = 40
+PROTECT_BRUSH_RADIUS_DEFAULT = 8
+PROTECT_OVERLAY_COLOR = (100, 220, 255, 80)  # translucent cyan overlay on protected pixels
+COLOR_PROTECT_THRESHOLD_MIN = 0
+COLOR_PROTECT_THRESHOLD_MAX = 120
+COLOR_PROTECT_THRESHOLD_DEFAULT = 15
 
 PREVIEW_BASE_WIDTH = 250
 PREVIEW_BASE_HEIGHT = 200
@@ -160,8 +167,65 @@ def tk_rgb_from_color_tuple(color):
     return f"#{red:02x}{green:02x}{blue:02x}"
 
 
-def apply_color_cleanup(image, cleanup_colors, threshold=0, exact_colors=None):
-    """Make pixels transparent when they match any selected cleanup color within tolerance, or exact match."""
+def make_empty_protection_mask(width, height):
+    """Return a fresh boolean numpy array (H x W) with all pixels unprotected."""
+    return np.zeros((height, width), dtype=bool)
+
+
+def apply_protection_brush(protection_mask, cx, cy, radius):
+    """Paint a circular brush stroke onto *protection_mask* in-place.
+
+    Args:
+        protection_mask: 2-D boolean numpy array (H x W).
+        cx, cy: Centre of the brush stroke in mask coordinates (x=col, y=row).
+        radius: Brush radius in pixels.
+    """
+    h, w = protection_mask.shape
+    y_min = max(0, int(cy - radius))
+    y_max = min(h - 1, int(cy + radius))
+    x_min = max(0, int(cx - radius))
+    x_max = min(w - 1, int(cx + radius))
+    r2 = radius * radius
+    for row in range(y_min, y_max + 1):
+        for col in range(x_min, x_max + 1):
+            if (row - cy) ** 2 + (col - cx) ** 2 <= r2:
+                protection_mask[row, col] = True
+
+
+def erase_protection_brush(protection_mask, cx, cy, radius):
+    """Erase a circular brush stroke from *protection_mask* in-place."""
+    h, w = protection_mask.shape
+    y_min = max(0, int(cy - radius))
+    y_max = min(h - 1, int(cy + radius))
+    x_min = max(0, int(cx - radius))
+    x_max = min(w - 1, int(cx + radius))
+    r2 = radius * radius
+    for row in range(y_min, y_max + 1):
+        for col in range(x_min, x_max + 1):
+            if (row - cy) ** 2 + (col - cx) ** 2 <= r2:
+                protection_mask[row, col] = False
+
+
+def apply_color_cleanup(image, cleanup_colors, threshold=0, exact_colors=None,
+                        protection_mask=None, protected_colors=None,
+                        protected_threshold=0):
+    """Make pixels transparent where they match a cleanup color within tolerance (or exactly).
+
+    Safety-first design: when a pixel matches both a cleanup color and a
+    protected color, the pixel is KEPT (protection wins over cleanup).
+
+    Args:
+        image: PIL Image to clean up.
+        cleanup_colors: List of RGB tuples to remove.
+        threshold: Max per-channel distance for cleanup colour matching.
+        exact_colors: List of RGB tuples to remove with exact match only.
+        protection_mask: Optional boolean H x W numpy array (brush-based).
+            Pixels marked True are never cleared, regardless of any colour
+            match.  Pass None to skip.
+        protected_colors: List of RGB tuples to protect from removal.
+        protected_threshold: Max per-channel distance for protected colour
+            matching.
+    """
     rgba_image = image.convert("RGBA")
     if not cleanup_colors and not exact_colors:
         return rgba_image
@@ -191,6 +255,28 @@ def apply_color_cleanup(image, cleanup_colors, threshold=0, exact_colors=None):
             matched_mask |= channel_difference == 0
 
     matched_mask &= opaque_mask
+
+    # Build a colour-based protection mask from protected_colors.
+    # Any pixel matching a protected colour is exempt from cleanup,
+    # even if it also matches a cleanup colour (safety-first).
+    if protected_colors:
+        color_protect_mask = np.zeros(opaque_mask.shape, dtype=bool)
+        pt = max(0, int(protected_threshold))
+        for color in protected_colors:
+            target = np.array([int(ch) for ch in color[:3]], dtype=np.int16)
+            channel_diff = np.max(np.abs(rgb_values - target), axis=2)
+            color_protect_mask |= channel_diff <= pt
+        matched_mask &= ~color_protect_mask
+
+    # Exempt brush-painted protected pixels from cleanup (takes absolute priority).
+    if protection_mask is not None:
+        try:
+            pm = np.asarray(protection_mask, dtype=bool)
+            if pm.shape == matched_mask.shape:
+                matched_mask &= ~pm
+        except Exception:
+            pass
+
     if not np.any(matched_mask):
         return rgba_image
 
@@ -204,9 +290,24 @@ def resolve_color_cleanup_worker_count(frame_count):
     return max(1, min(MAX_COLOR_CLEANUP_WORKERS, available_cpus, int(frame_count or 1)))
 
 
-def finalize_processed_cutout(cutout, destination, cleanup_colors, cleanup_threshold, exact_colors=None, auto_crop=True, target_size=None, crop_padding=0):
-    """Run the final cleanup pass, crop, resize and save one processed frame."""
-    finalized = apply_color_cleanup(cutout, cleanup_colors or [], cleanup_threshold, exact_colors or [])
+def finalize_processed_cutout(cutout, destination, cleanup_colors, cleanup_threshold,
+                              exact_colors=None, auto_crop=True, target_size=None,
+                              crop_padding=0, protection_mask=None,
+                              protected_colors=None, protected_threshold=0):
+    """Run the final cleanup pass, crop, resize and save one processed frame.
+
+    Args:
+        protection_mask: Optional boolean numpy array (H x W). Pixels that are
+            True are never cleared by color cleanup.  Pass None to disable.
+        protected_colors: List of RGB tuples to protect from removal.
+        protected_threshold: Per-channel tolerance for protected colour matching.
+    """
+    finalized = apply_color_cleanup(
+        cutout, cleanup_colors or [], cleanup_threshold, exact_colors or [],
+        protection_mask=protection_mask,
+        protected_colors=protected_colors or [],
+        protected_threshold=protected_threshold,
+    )
     if auto_crop:
         finalized = crop_to_visible_bounds(finalized, padding=crop_padding)
     if target_size and target_size[0] > 0 and target_size[1] > 0:
@@ -398,9 +499,15 @@ class BackgroundRemoverApp:
         self.video_cleanup_threshold = tk.IntVar(value=COLOR_CLEANUP_THRESHOLD_DEFAULT)
         self.video_cleanup_colors = []
         self.video_exact_cleanup_colors = []
+        self.video_protected_colors = []
+        self.video_protected_threshold = tk.IntVar(value=COLOR_PROTECT_THRESHOLD_DEFAULT)
         self.preview_color_pick_active = False
+        self.video_protect_color_pick_active = False
         self.image_cleanup_colors = []
         self.image_exact_cleanup_colors = []
+        self.image_protected_colors = []
+        self.image_protected_threshold = tk.IntVar(value=COLOR_PROTECT_THRESHOLD_DEFAULT)
+        self.image_protect_color_pick_mode = "off"
         self.image_color_pick_mode = "off"
         self.input_preview_zoom = tk.DoubleVar(value=1.0)
         self.output_preview_zoom = tk.DoubleVar(value=1.0)
@@ -414,6 +521,13 @@ class BackgroundRemoverApp:
         self._input_source_size = None
         self._output_source_size = None
         self.output_preview_display_path = None
+
+        # Protect-brush interaction state (video frame preview).
+        # Possible values: "off", "protect", "erase_protect"
+        self._frame_preview_interaction_mode = "off"
+        self.protect_brush_radius = tk.IntVar(value=PROTECT_BRUSH_RADIUS_DEFAULT)
+        # Whether the user is currently dragging the brush on the preview canvas.
+        self._protect_brush_dragging = False
 
         # Apply any previously-saved user preferences before building the UI.
         self._apply_saved_preferences()
@@ -806,6 +920,99 @@ class BackgroundRemoverApp:
             style='Small.TLabel',
         )
         self.image_cleanup_colors_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        # ── Image Protected Colors ────────────────────────────────
+        image_protect_frame = ttk.Frame(right_col)
+        image_protect_frame.pack(fill=tk.X, pady=(12, 0))
+
+        image_protect_header = ttk.Frame(image_protect_frame)
+        image_protect_header.pack(fill=tk.X)
+        tk.Label(
+            image_protect_header, text="Protected Colors",
+            bg=ModernStyle.BG_PRIMARY, fg="#FF9500",
+            font=("SF Pro Text", 13, "bold"),
+        ).pack(side=tk.LEFT)
+        self.image_protected_threshold_value_label = ttk.Label(
+            image_protect_header,
+            text=str(self.image_protected_threshold.get()),
+            style='Small.TLabel',
+        )
+        self.image_protected_threshold_value_label.pack(side=tk.RIGHT)
+
+        self.image_protected_threshold_scale = tk.Scale(
+            image_protect_frame,
+            from_=COLOR_PROTECT_THRESHOLD_MIN,
+            to=COLOR_PROTECT_THRESHOLD_MAX,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=self.image_protected_threshold,
+            command=self._on_image_protected_threshold_change,
+            bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            troughcolor=ModernStyle.BG_TERTIARY,
+            activebackground="#FF9500",
+            highlightthickness=0,
+            font=ModernStyle.FONT_SMALL,
+        )
+        self.image_protected_threshold_scale.pack(fill=tk.X, pady=(5, 0))
+
+        ttk.Label(
+            image_protect_frame,
+            text="\u26a0 Protected colours override cleanup when ranges overlap (safety-first).",
+            style='Small.TLabel',
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+        image_protect_button_row = ttk.Frame(image_protect_frame)
+        image_protect_button_row.pack(fill=tk.X, pady=(10, 8))
+
+        self.pick_image_protect_color_btn = RoundedButton(
+            image_protect_button_row,
+            text="Sample: off (click to cycle)",
+            command=self._toggle_image_protect_color_pick,
+            width=180,
+            height=38,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.pick_image_protect_color_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.add_image_protect_color_btn = RoundedButton(
+            image_protect_button_row,
+            text="Add Color...",
+            command=self._choose_image_protected_color,
+            width=140,
+            height=38,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.add_image_protect_color_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.clear_image_protect_colors_btn = RoundedButton(
+            image_protect_button_row,
+            text="Clear Colors",
+            command=self._clear_image_protected_colors,
+            width=130,
+            height=38,
+            bg=ModernStyle.BG_TERTIARY,
+            hover_bg=ModernStyle.BORDER,
+        )
+        self.clear_image_protect_colors_btn.pack(side=tk.LEFT)
+
+        image_protect_summary_row = ttk.Frame(image_protect_frame)
+        image_protect_summary_row.pack(fill=tk.X, pady=(6, 0))
+
+        self.image_protected_swatches_frame = tk.Frame(
+            image_protect_summary_row,
+            bg=ModernStyle.BG_PRIMARY,
+        )
+        self.image_protected_swatches_frame.pack(side=tk.LEFT)
+
+        self.image_protected_colors_label = ttk.Label(
+            image_protect_summary_row,
+            text="No protected colors selected.",
+            style='Small.TLabel',
+        )
+        self.image_protected_colors_label.pack(side=tk.LEFT, padx=(8, 0))
 
         process_row = ttk.Frame(right_col)
         process_row.pack(pady=(10, 10))
@@ -1212,7 +1419,62 @@ class BackgroundRemoverApp:
             side=tk.LEFT, fill=tk.Y, padx=6, pady=2,
         )
 
-        # — Save group (right-aligned) —
+        # — Protect-brush group —
+        self.protect_mode_btn = RoundedButton(
+            toolbar_inner, text="Protect",
+            command=self._toggle_protect_mode,
+            width=65, height=28,
+            bg=ModernStyle.BG_TERTIARY, hover_bg=ModernStyle.BORDER,
+            font=ModernStyle.FONT_SMALL,
+        )
+        self.protect_mode_btn.pack(side=tk.LEFT, padx=(0, 2))
+        self.protect_mode_btn.configure_state("disabled")
+
+        self.erase_protect_btn = RoundedButton(
+            toolbar_inner, text="Erase Protect",
+            command=self._toggle_erase_protect_mode,
+            width=95, height=28,
+            bg=ModernStyle.BG_TERTIARY, hover_bg=ModernStyle.BORDER,
+            font=ModernStyle.FONT_SMALL,
+        )
+        self.erase_protect_btn.pack(side=tk.LEFT, padx=(0, 2))
+        self.erase_protect_btn.configure_state("disabled")
+
+        self.clear_protect_btn = RoundedButton(
+            toolbar_inner, text="Clear Protect",
+            command=self._clear_current_frame_protection,
+            width=90, height=28,
+            bg=ModernStyle.BG_TERTIARY, hover_bg=ModernStyle.BORDER,
+            font=ModernStyle.FONT_SMALL,
+        )
+        self.clear_protect_btn.pack(side=tk.LEFT, padx=(0, 2))
+        self.clear_protect_btn.configure_state("disabled")
+
+        # Brush-size slider (compact, inline)
+        tk.Label(
+            toolbar_inner, text="Brush:",
+            bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY,
+            font=("SF Pro Text", 9),
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        self._protect_radius_scale = tk.Scale(
+            toolbar_inner,
+            from_=PROTECT_BRUSH_RADIUS_MIN, to=PROTECT_BRUSH_RADIUS_MAX,
+            resolution=1, orient=tk.HORIZONTAL,
+            variable=self.protect_brush_radius,
+            bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY,
+            troughcolor=ModernStyle.BG_TERTIARY,
+            activebackground=ModernStyle.ACCENT,
+            highlightthickness=0, showvalue=False, sliderlength=10,
+            width=10, length=70,
+        )
+        self._protect_radius_scale.pack(side=tk.LEFT, padx=(2, 0))
+
+        # Divider before save group
+        tk.Frame(toolbar_inner, bg=ModernStyle.BORDER, width=1).pack(
+            side=tk.LEFT, fill=tk.Y, padx=6, pady=2,
+        )
+
+
         self._export_settings_btn = RoundedButton(
             toolbar_inner, text="⚙",
             command=self._open_export_settings_dialog,
@@ -1573,6 +1835,91 @@ class BackgroundRemoverApp:
         )
         self.video_exact_cleanup_colors_label.pack(side=tk.LEFT)
 
+        # ── Row 5: Protected-color tolerance ──────────────────────────
+        protect_tol_row = tk.Frame(settings_inner, bg=ModernStyle.BG_TERTIARY)
+        protect_tol_row.pack(fill=tk.X, pady=(6, 4))
+
+        tk.Label(
+            protect_tol_row, text="Protect Tol",
+            bg=ModernStyle.BG_TERTIARY, fg="#FF9500",
+            font=("SF Pro Text", 10, "bold"), width=9, anchor="w",
+        ).pack(side=tk.LEFT)
+
+        self.video_protected_threshold_scale = tk.Scale(
+            protect_tol_row,
+            from_=COLOR_PROTECT_THRESHOLD_MIN, to=COLOR_PROTECT_THRESHOLD_MAX,
+            resolution=1, orient=tk.HORIZONTAL,
+            variable=self.video_protected_threshold,
+            command=self._on_video_protected_threshold_change,
+            bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY,
+            troughcolor="#3a3a3c",
+            activebackground="#FF9500",
+            highlightthickness=0, showvalue=False, sliderlength=12,
+            font=ModernStyle.FONT_SMALL,
+        )
+        self.video_protected_threshold_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 6))
+
+        self.video_protected_threshold_value_label = tk.Label(
+            protect_tol_row, text=f"Tol: {self.video_protected_threshold.get()}",
+            bg=ModernStyle.BG_TERTIARY, fg="#FF9500",
+            font=("SF Pro Text", 10), width=5, anchor="e",
+        )
+        self.video_protected_threshold_value_label.pack(side=tk.RIGHT)
+
+        # ── Row 6: Protected color list ─────────────────────────────
+        cr3 = tk.Frame(settings_inner, bg=ModernStyle.BG_TERTIARY)
+        cr3.pack(fill=tk.X, pady=(0, 3))
+
+        tk.Label(
+            cr3, text="Protect Colors",
+            bg=ModernStyle.BG_TERTIARY, fg="#FF9500",
+            font=("SF Pro Text", 10, "bold"), width=13, anchor="w",
+        ).pack(side=tk.LEFT)
+
+        self.pick_protect_color_btn = RoundedButton(
+            cr3, text="Sample",
+            command=self._toggle_video_protect_color_pick,
+            width=58, height=22,
+            bg=ModernStyle.BG_SECONDARY, hover_bg=ModernStyle.BORDER,
+            font=("SF Pro Text", 9),
+        )
+        self.pick_protect_color_btn.pack(side=tk.LEFT, padx=(0, 2))
+
+        self.add_protect_color_btn = RoundedButton(
+            cr3, text="Add",
+            command=self._choose_video_protected_color,
+            width=38, height=22,
+            bg=ModernStyle.BG_SECONDARY, hover_bg=ModernStyle.BORDER,
+            font=("SF Pro Text", 9),
+        )
+        self.add_protect_color_btn.pack(side=tk.LEFT, padx=(0, 2))
+
+        self.clear_protect_colors_btn = RoundedButton(
+            cr3, text="Clear",
+            command=self._clear_video_protected_colors,
+            width=42, height=22,
+            bg=ModernStyle.BG_SECONDARY, hover_bg=ModernStyle.BORDER,
+            font=("SF Pro Text", 9),
+        )
+        self.clear_protect_colors_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.video_protected_swatches_frame = tk.Frame(cr3, bg=ModernStyle.BG_TERTIARY)
+        self.video_protected_swatches_frame.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.video_protected_colors_label = tk.Label(
+            cr3, text="No colors",
+            bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_SECONDARY,
+            font=("SF Pro Text", 9),
+        )
+        self.video_protected_colors_label.pack(side=tk.LEFT)
+
+        tk.Label(
+            settings_inner,
+            text="\u26a0 Protected colors override cleanup when colours overlap (safety-first).",
+            bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_SECONDARY,
+            font=("SF Pro Text", 9), anchor="w",
+        ).pack(fill=tk.X, pady=(2, 4))
+
         # ── Initialize control states ──────────────────────────────
         # Create hidden references for export settings used by other methods
         self.frame_output_entry = None
@@ -1928,9 +2275,14 @@ class BackgroundRemoverApp:
         self.remove_bg_frames_btn.configure_state("disabled")
         self.remove_bg_frames_options_btn.configure_state("disabled")
         self.preview_color_pick_active = False
+        self.video_protect_color_pick_active = False
+        self._frame_preview_interaction_mode = "off"
+        self._protect_brush_dragging = False
         if clear_cleanup_colors:
             self.video_cleanup_colors = []
+            self.video_protected_colors = []
         self._refresh_video_cleanup_controls()
+        self._refresh_protect_controls()
         self._cleanup_frame_temp_dir()
 
     def _cleanup_frame_temp_dir(self):
@@ -2103,10 +2455,14 @@ class BackgroundRemoverApp:
             self.pick_cleanup_color_btn.configure_state("disabled")
             self.add_cleanup_color_btn.configure_state("disabled")
             self.clear_cleanup_colors_btn.configure_state("disabled")
+            self.protect_mode_btn.configure_state("disabled")
+            self.erase_protect_btn.configure_state("disabled")
+            self.clear_protect_btn.configure_state("disabled")
             return
 
         self.extract_frames_btn.configure_state("normal")
         has_frames = bool(self.frame_items)
+        has_frame_visible = self.current_frame_index is not None
         has_selected_frames = has_frames and self._selected_frame_count() > 0
         can_undo_video_edit = bool(self._video_edit_history)
         can_dedupe = len(self.all_extracted_frame_items) > 1 or len(self.frame_items) > 1
@@ -2118,9 +2474,13 @@ class BackgroundRemoverApp:
         self.remove_bg_frames_btn.configure_state("normal" if has_selected_frames else "disabled")
         self.remove_bg_frames_options_btn.configure_state("normal" if has_selected_frames else "disabled")
         self.apply_color_cleanup_frames_btn.configure_state("normal" if has_selected_frames else "disabled")
-        self.pick_cleanup_color_btn.configure_state("normal" if self.current_frame_index is not None else "disabled")
+        self.pick_cleanup_color_btn.configure_state("normal" if has_frame_visible else "disabled")
         self.add_cleanup_color_btn.configure_state("normal")
         self.clear_cleanup_colors_btn.configure_state("normal" if self.video_cleanup_colors else "disabled")
+        # Protect brush: available whenever a frame is shown.
+        self.protect_mode_btn.configure_state("normal" if has_frame_visible else "disabled")
+        self.erase_protect_btn.configure_state("normal" if has_frame_visible else "disabled")
+        self.clear_protect_btn.configure_state("normal" if has_frame_visible else "disabled")
 
     def _on_video_cleanup_threshold_change(self, _value=None):
         self.video_cleanup_threshold_value_label.configure(text=f"Tol: {self.video_cleanup_threshold.get()}")
@@ -2145,9 +2505,19 @@ class BackgroundRemoverApp:
         elif getattr(self, 'exact_preview_color_pick_active', False):
             self.pick_cleanup_color_btn.set_text("Click Preview (Exact)")
             self.frame_preview.configure(cursor="crosshair")
+        elif getattr(self, 'video_protect_color_pick_active', False):
+            self.pick_cleanup_color_btn.set_text("Sample From Preview")
+            self.frame_preview.configure(cursor="crosshair")
         else:
             self.pick_cleanup_color_btn.set_text("Sample From Preview")
             self.frame_preview.configure(cursor="")
+
+        # Update protect sample button text.
+        if hasattr(self, 'pick_protect_color_btn'):
+            if getattr(self, 'video_protect_color_pick_active', False):
+                self.pick_protect_color_btn.set_text("Click Preview")
+            else:
+                self.pick_protect_color_btn.set_text("Sample")
 
         self.video_cleanup_colors_label.configure(
             text=f"Cleanup colors: {self._cleanup_colors_summary(self.video_cleanup_colors)}. Tolerance: {self.video_cleanup_threshold.get()}"
@@ -2160,6 +2530,13 @@ class BackgroundRemoverApp:
             )
             self._rebuild_cleanup_swatches(self.video_exact_cleanup_swatches_frame, self.video_exact_cleanup_colors)
 
+        # Refresh protected-color controls.
+        if hasattr(self, 'video_protected_colors_label'):
+            self.video_protected_colors_label.configure(
+                text=f"Protected: {self._cleanup_colors_summary(self.video_protected_colors)}. Tol: {self.video_protected_threshold.get()}"
+            )
+            self._rebuild_cleanup_swatches(self.video_protected_swatches_frame, self.video_protected_colors)
+
         if self.video_processing:
             self.pick_cleanup_color_btn.configure_state("disabled")
             self.add_cleanup_color_btn.configure_state("disabled")
@@ -2168,6 +2545,10 @@ class BackgroundRemoverApp:
                 self.pick_exact_cleanup_color_btn.configure_state("disabled")
                 self.add_exact_cleanup_color_btn.configure_state("disabled")
                 self.clear_exact_cleanup_colors_btn.configure_state("disabled")
+            if hasattr(self, 'pick_protect_color_btn'):
+                self.pick_protect_color_btn.configure_state("disabled")
+                self.add_protect_color_btn.configure_state("disabled")
+                self.clear_protect_colors_btn.configure_state("disabled")
             return
 
         self.pick_cleanup_color_btn.configure_state("normal" if self.current_frame_index is not None else "disabled")
@@ -2179,6 +2560,11 @@ class BackgroundRemoverApp:
             self.add_exact_cleanup_color_btn.configure_state("normal")
             self.clear_exact_cleanup_colors_btn.configure_state("normal" if getattr(self, 'video_exact_cleanup_colors', []) else "disabled")
 
+        if hasattr(self, 'pick_protect_color_btn'):
+            self.pick_protect_color_btn.configure_state("normal" if self.current_frame_index is not None else "disabled")
+            self.add_protect_color_btn.configure_state("normal")
+            self.clear_protect_colors_btn.configure_state("normal" if self.video_protected_colors else "disabled")
+
     def _toggle_preview_color_pick(self):
         if self.current_frame_index is None:
             messagebox.showerror("Error", "Select a frame preview before sampling a cleanup color.")
@@ -2187,6 +2573,7 @@ class BackgroundRemoverApp:
         self.preview_color_pick_active = not self.preview_color_pick_active
         if self.preview_color_pick_active:
             self.exact_preview_color_pick_active = False
+            self.video_protect_color_pick_active = False
         self._refresh_video_cleanup_controls()
         if self.current_frame_index is not None:
             self._show_frame_preview(self.current_frame_index)
@@ -2199,6 +2586,7 @@ class BackgroundRemoverApp:
         self.exact_preview_color_pick_active = not getattr(self, 'exact_preview_color_pick_active', False)
         if getattr(self, 'exact_preview_color_pick_active', False):
             self.preview_color_pick_active = False
+            self.video_protect_color_pick_active = False
         
         if getattr(self, 'exact_preview_color_pick_active', False):
             self.pick_exact_cleanup_color_btn.set_text("Click Preview")
@@ -2270,10 +2658,66 @@ class BackgroundRemoverApp:
         if self.current_frame_index is not None:
             self._show_frame_preview(self.current_frame_index)
 
+    # ── Video protected-color handlers ──────────────────────────────
+
+    def _on_video_protected_threshold_change(self, _value=None):
+        """Update the protect-tolerance label and refresh preview on slider change."""
+        self.video_protected_threshold_value_label.configure(
+            text=f"Tol: {self.video_protected_threshold.get()}"
+        )
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+        else:
+            self._refresh_video_cleanup_controls()
+
+    def _toggle_video_protect_color_pick(self):
+        """Toggle sampling a protect-color from the frame preview."""
+        if self.current_frame_index is None:
+            messagebox.showerror("Error", "Select a frame preview before sampling a protected color.")
+            return
+        self.video_protect_color_pick_active = not self.video_protect_color_pick_active
+        if self.video_protect_color_pick_active:
+            # Exit other pick modes.
+            self.preview_color_pick_active = False
+            self.exact_preview_color_pick_active = False
+        self._refresh_video_cleanup_controls()
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+
+    def _choose_video_protected_color(self):
+        """Open the system color chooser for a protected color."""
+        chosen, hex_color = colorchooser.askcolor(
+            title="Choose Protected Color",
+            parent=self.root,
+        )
+        if chosen is None or hex_color is None:
+            return
+        color = tuple(int(round(ch)) for ch in chosen[:3])
+        self._add_video_protected_color(color)
+
+    def _add_video_protected_color(self, color):
+        """Add a normalized RGB colour to the video protected-colors list."""
+        normalized = tuple(max(0, min(255, int(ch))) for ch in color[:3])
+        if normalized not in self.video_protected_colors:
+            self.video_protected_colors.append(normalized)
+        self.video_protect_color_pick_active = False
+        self._refresh_video_cleanup_controls()
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+
+    def _clear_video_protected_colors(self):
+        """Clear all video protected colors."""
+        self.video_protected_colors = []
+        self.video_protect_color_pick_active = False
+        self._refresh_video_cleanup_controls()
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+
     def _current_frame_item(self):
         return next((item for item in self.frame_items if item["index"] == self.current_frame_index), None)
 
     def _snapshot_video_frame_items(self):
+        """Snapshot all frame items for undo history, including protection masks."""
         snapshot = []
         for item in self.frame_items:
             snapshot_item = {
@@ -2283,6 +2727,10 @@ class BackgroundRemoverApp:
             }
             selected_var = item.get("selected_var")
             snapshot_item["_selected"] = selected_var.get() if selected_var is not None else bool(item.get("_selected", False))
+            # Deep-copy the protection mask so undo history is isolated.
+            pm = item.get("protection_mask")
+            if pm is not None:
+                snapshot_item["protection_mask"] = pm.copy()
             snapshot.append(snapshot_item)
         return snapshot
 
@@ -2357,8 +2805,9 @@ class BackgroundRemoverApp:
     def _on_frame_preview_click(self, event):
         is_threshold_pick = self.preview_color_pick_active
         is_exact_pick = getattr(self, 'exact_preview_color_pick_active', False)
+        is_protect_pick = getattr(self, 'video_protect_color_pick_active', False)
         
-        if not (is_threshold_pick or is_exact_pick) or self.current_frame_index is None or self.frame_preview_photo is None:
+        if not (is_threshold_pick or is_exact_pick or is_protect_pick) or self.current_frame_index is None or self.frame_preview_photo is None:
             return
 
         current_item = self._current_frame_item()
@@ -2385,7 +2834,13 @@ class BackgroundRemoverApp:
             source_y = min(source_image.height - 1, max(0, int(local_y * source_image.height / display_height)))
             sampled_color = source_image.getpixel((source_x, source_y))
 
-        if is_exact_pick:
+        if is_protect_pick:
+            self._add_video_protected_color(sampled_color)
+            self.video_status_label.configure(
+                text=f"Added protected color {format_rgb_color(sampled_color)}.",
+                foreground="#FF9500",
+            )
+        elif is_exact_pick:
             self._add_video_exact_cleanup_color(sampled_color)
             self.video_status_label.configure(
                 text=f"Added exact cleanup color {format_rgb_color(sampled_color)}.",
@@ -2397,6 +2852,159 @@ class BackgroundRemoverApp:
                 text=f"Added cleanup color {format_rgb_color(sampled_color)}.",
                 foreground=ModernStyle.SUCCESS,
             )
+
+    # ── Protect-brush methods ──────────────────────────────────────────────
+
+    def _toggle_protect_mode(self):
+        """Toggle the protect-brush interaction mode on/off."""
+        if self.current_frame_index is None:
+            messagebox.showerror("Error", "Select a frame before painting a protection mask.")
+            return
+        if self._frame_preview_interaction_mode == "protect":
+            self._exit_protect_mode()
+        else:
+            self._frame_preview_interaction_mode = "protect"
+            # Exit color-pick modes.
+            self.preview_color_pick_active = False
+            self.exact_preview_color_pick_active = False
+            self.video_protect_color_pick_active = False
+            self._bind_protect_brush_events()
+            self._refresh_protect_controls()
+            self._show_frame_preview(self.current_frame_index)
+
+    def _toggle_erase_protect_mode(self):
+        """Toggle the erase-protect brush interaction mode on/off."""
+        if self.current_frame_index is None:
+            messagebox.showerror("Error", "Select a frame before erasing a protection mask.")
+            return
+        if self._frame_preview_interaction_mode == "erase_protect":
+            self._exit_protect_mode()
+        else:
+            self._frame_preview_interaction_mode = "erase_protect"
+            self.preview_color_pick_active = False
+            self.exact_preview_color_pick_active = False
+            self.video_protect_color_pick_active = False
+            self._bind_protect_brush_events()
+            self._refresh_protect_controls()
+            self._show_frame_preview(self.current_frame_index)
+
+    def _exit_protect_mode(self):
+        """Return the frame preview to its default (no-brush) interaction mode."""
+        self._frame_preview_interaction_mode = "off"
+        self._protect_brush_dragging = False
+        self._unbind_protect_brush_events()
+        self._refresh_protect_controls()
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+
+    def _refresh_protect_controls(self):
+        """Update the visual state of protect toolbar buttons to match the active mode."""
+        if not hasattr(self, "protect_mode_btn"):
+            return
+        mode = self._frame_preview_interaction_mode
+        # Highlight the active mode with the accent colour; restore others to normal.
+        protect_bg = ModernStyle.ACCENT if mode == "protect" else ModernStyle.BG_TERTIARY
+        erase_bg = ModernStyle.ACCENT if mode == "erase_protect" else ModernStyle.BG_TERTIARY
+        self.protect_mode_btn.bg_color = protect_bg
+        self.protect_mode_btn.itemconfig(self.protect_mode_btn.rect, fill=protect_bg)
+        self.erase_protect_btn.bg_color = erase_bg
+        self.erase_protect_btn.itemconfig(self.erase_protect_btn.rect, fill=erase_bg)
+
+        cursor = "crosshair" if mode in ("protect", "erase_protect") else ""
+        self.frame_preview_canvas.configure(cursor=cursor)
+
+    def _bind_protect_brush_events(self):
+        """Connect mouse-press and drag events to the brush handler."""
+        self.frame_preview_canvas.bind("<ButtonPress-1>", self._on_protect_brush_press)
+        self.frame_preview_canvas.bind("<B1-Motion>", self._on_protect_brush_drag)
+        self.frame_preview_canvas.bind("<ButtonRelease-1>", self._on_protect_brush_release)
+
+    def _unbind_protect_brush_events(self):
+        """Remove brush bindings and restore the default click handler."""
+        self.frame_preview_canvas.unbind("<ButtonPress-1>")
+        self.frame_preview_canvas.unbind("<B1-Motion>")
+        self.frame_preview_canvas.unbind("<ButtonRelease-1>")
+        # Re-attach the original click handler from _bind_frame_navigation.
+        self.frame_preview_canvas.bind("<Button-1>", self._on_frame_preview_click)
+
+    def _canvas_event_to_mask_coords(self, event):
+        """Convert a canvas mouse event to source-image (mask) coordinates.
+
+        Returns (mask_x_float, mask_y_float) or None if the event was outside
+        the displayed image.
+        """
+        item = self._current_frame_item()
+        if item is None:
+            return None
+        canvas = self.frame_preview_canvas
+        cx = canvas.canvasx(event.x)
+        cy = canvas.canvasy(event.y)
+        x0 = getattr(self, "_frame_preview_x0", 0)
+        y0 = getattr(self, "_frame_preview_y0", 0)
+        dw, dh = getattr(self, "_frame_preview_display_size", (1, 1))
+        local_x = cx - x0
+        local_y = cy - y0
+        if local_x < 0 or local_y < 0 or local_x >= dw or local_y >= dh:
+            return None
+        src_w, src_h = item["size"]
+        mask_x = local_x * src_w / max(dw, 1)
+        mask_y = local_y * src_h / max(dh, 1)
+        return mask_x, mask_y
+
+    def _apply_brush_stroke(self, event):
+        """Apply one brush stroke at the current event position to the active frame's mask."""
+        mode = self._frame_preview_interaction_mode
+        if mode not in ("protect", "erase_protect"):
+            return
+        coords = self._canvas_event_to_mask_coords(event)
+        if coords is None:
+            return
+        mx, my = coords
+        item = self._current_frame_item()
+        if item is None:
+            return
+        src_w, src_h = item["size"]
+        # Ensure the frame has a protection mask.
+        if item.get("protection_mask") is None:
+            item["protection_mask"] = make_empty_protection_mask(src_w, src_h)
+        radius = self.protect_brush_radius.get()
+        if mode == "protect":
+            apply_protection_brush(item["protection_mask"], mx, my, radius)
+        else:
+            erase_protection_brush(item["protection_mask"], mx, my, radius)
+
+    def _on_protect_brush_press(self, event):
+        """Start a brush drag stroke."""
+        self._protect_brush_dragging = True
+        self._apply_brush_stroke(event)
+        # Refresh overlay on each stroke.
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+
+    def _on_protect_brush_drag(self, event):
+        """Continue the brush drag stroke."""
+        if not self._protect_brush_dragging:
+            return
+        self._apply_brush_stroke(event)
+        if self.current_frame_index is not None:
+            self._show_frame_preview(self.current_frame_index)
+
+    def _on_protect_brush_release(self, event):
+        """Finish the brush drag stroke."""
+        self._protect_brush_dragging = False
+
+    def _clear_current_frame_protection(self):
+        """Remove the entire protection mask from the currently previewed frame."""
+        item = self._current_frame_item()
+        if item is None:
+            return
+        item["protection_mask"] = None
+        self._exit_protect_mode()
+        self.video_status_label.configure(
+            text="Protection mask cleared for this frame.",
+            foreground=ModernStyle.SUCCESS,
+        )
+        self._show_frame_preview(self.current_frame_index)
 
     def remove_duplicate_frames(self):
         """Start duplicate-frame removal in a background thread."""
@@ -2531,7 +3139,7 @@ class BackgroundRemoverApp:
             widget.bind("<Button-1>", lambda _event, idx=index: self._show_frame_preview(idx))
 
     def _show_frame_preview(self, index):
-        """Display the selected frame larger on the right side"""
+        """Display the selected frame in the preview canvas, with a protection overlay if one exists."""
         matching = next((item for item in self.frame_items if item["index"] == index), None)
         if matching is None:
             return
@@ -2539,20 +3147,38 @@ class BackgroundRemoverApp:
         self.current_frame_index = index
         with Image.open(matching["path"]) as opened_image:
             image = opened_image.copy()
-        # Keep it somewhat constrained but allow scroll scrolling
+        # Keep it somewhat constrained but allow scrolling.
         image.thumbnail((1200, 900), Image.Resampling.LANCZOS)
-        self.frame_preview_photo = ImageTk.PhotoImage(image)
-        
+        dw, dh = image.size
+
+        # Draw protection overlay if the frame has one.
+        pm = matching.get("protection_mask")
+        if pm is not None and np.any(pm):
+            # Scale the mask to display resolution.
+            src_w, src_h = matching["size"]
+            mask_img = Image.fromarray((pm * 255).astype(np.uint8), mode="L")
+            mask_resized = mask_img.resize((dw, dh), Image.Resampling.NEAREST)
+            overlay = Image.new("RGBA", (dw, dh), (0, 0, 0, 0))
+            oc = PROTECT_OVERLAY_COLOR
+            overlay_color_layer = Image.new("RGBA", (dw, dh), oc)
+            overlay.paste(overlay_color_layer, mask=mask_resized)
+            base = image.convert("RGBA")
+            composited = Image.alpha_composite(base, overlay)
+            self.frame_preview_photo = ImageTk.PhotoImage(composited)
+        else:
+            self.frame_preview_photo = ImageTk.PhotoImage(image)
+
         canvas = self.frame_preview_canvas
         canvas.delete("all")
-        dw, dh = image.size
         cw = max(canvas.winfo_width(), 1)
         ch = max(canvas.winfo_height(), 1)
         x0 = max(0, (cw - dw) // 2)
         y0 = max(0, (ch - dh) // 2)
         self._frame_preview_x0 = x0
         self._frame_preview_y0 = y0
-        
+        # Store display dimensions for brush coordinate mapping.
+        self._frame_preview_display_size = (dw, dh)
+
         canvas.create_image(x0, y0, image=self.frame_preview_photo, anchor=tk.NW)
         canvas.config(scrollregion=(0, 0, max(cw, dw), max(ch, dh)))
 
@@ -2562,12 +3188,20 @@ class BackgroundRemoverApp:
         meta_text = f"{matching['name']}  \u00b7  {width}\u00d7{height}  \u00b7  {sel_icon} {'Selected' if matching['selected_var'].get() else 'Not selected'}  \u00b7  {selected_count} of {len(self.frame_items)} selected"
         if self.preview_color_pick_active or getattr(self, 'exact_preview_color_pick_active', False):
             meta_text += "  \u00b7  Click preview to sample a cleanup color"
+        elif getattr(self, 'video_protect_color_pick_active', False):
+            meta_text += "  \u00b7  \U0001f6e1 Click preview to sample a protected color"
+        mode = self._frame_preview_interaction_mode
+        if mode == "protect":
+            meta_text += "  \u00b7  \U0001f6e1 Paint protection \u2014 drag to protect pixels"
+        elif mode == "erase_protect":
+            meta_text += "  \u00b7  \u2702 Erase protection \u2014 drag to unprotect pixels"
         self.frame_preview_meta.configure(text=meta_text)
         self._update_sidebar_counts()
         if hasattr(self, '_preview_info_label'):
             self._preview_info_label.configure(text=f"{matching['name']}  \u00b7  {width}\u00d7{height}")
         self._refresh_frame_highlight()
         self._refresh_video_cleanup_controls()
+        self._refresh_protect_controls()
 
     def _refresh_frame_highlight(self):
         """Refresh sidebar highlight for the current frame"""
@@ -2829,7 +3463,9 @@ class BackgroundRemoverApp:
                 self.video_cleanup_threshold.get(),
                 list(self.video_exact_cleanup_colors),
                 self.video_bg_auto_crop.get(),
-                self.video_bg_crop_padding.get()
+                self.video_bg_crop_padding.get(),
+                list(self.video_protected_colors),
+                self.video_protected_threshold.get(),
             ),
             daemon=True,
         )
@@ -2848,7 +3484,7 @@ class BackgroundRemoverApp:
             position = pending_futures.pop(completed_future)
             saved_paths_by_position[position] = completed_future.result()
 
-    def _process_frames_inline_thread(self, selected_items, action, model_name, alpha_matting, cleanup_colors, cleanup_threshold, exact_colors, auto_crop, crop_padding):
+    def _process_frames_inline_thread(self, selected_items, action, model_name, alpha_matting, cleanup_colors, cleanup_threshold, exact_colors, auto_crop, crop_padding, protected_colors=None, protected_threshold=0):
         """Process frames inline, updating them in temp directory."""
         import uuid
         try:
@@ -2905,6 +3541,11 @@ class BackgroundRemoverApp:
 
                     cols = cleanup_colors if action == "color_cleanup" else []
                     exacts = exact_colors if action == "color_cleanup" else []
+                    # Honour the per-frame protection mask for colour cleanup.
+                    item_protection_mask = item.get("protection_mask")
+
+                    p_cols = protected_colors if action == "color_cleanup" else []
+                    p_thr = protected_threshold if action == "color_cleanup" else 0
 
                     future = executor.submit(
                         finalize_processed_cutout,
@@ -2915,7 +3556,10 @@ class BackgroundRemoverApp:
                         exacts,
                         auto_crop if action == "remove_background" else False,
                         None,  # Resize happens on "save selected"
-                        crop_padding if action == "remove_background" else 0
+                        crop_padding if action == "remove_background" else 0,
+                        item_protection_mask,
+                        p_cols,
+                        p_thr,
                     )
                     pending_futures[future] = item
 
@@ -3008,7 +3652,7 @@ class BackgroundRemoverApp:
         )
         messagebox.showerror("Error", f"Failed to save selected frames:\n\n{error_msg}")
     def remove_background_and_save_selected_frames(self):
-        """Batch remove backgrounds from selected frames and save them to output directory."""
+        """Batch remove backgrounds from selected frames and save them to the output directory."""
         if not self.frame_items:
             messagebox.showerror("Error", "Extract frames before processing them.")
             return
@@ -3026,7 +3670,7 @@ class BackgroundRemoverApp:
                 messagebox.showerror("Error", f"Could not create output directory:\n{e}")
                 return
 
-        # Get target size if specified
+        # Resolve optional target size from export settings.
         target_size = None
         try:
             w = self.video_export_width.get().strip()
@@ -3040,7 +3684,7 @@ class BackgroundRemoverApp:
         self.video_progress.start(10)
         self._set_video_action_states(is_busy=True)
         self.video_status_label.configure(
-            text=f"Removing backgrounds and saving {len(selected_items)} frame(s)...",
+            text=f"Starting background removal for {len(selected_items)} frame(s)...",
             foreground=ModernStyle.TEXT_SECONDARY,
         )
 
@@ -3053,19 +3697,29 @@ class BackgroundRemoverApp:
                 self.video_bg_alpha_matting.get(),
                 target_size,
                 self.video_bg_auto_crop.get(),
-                self.video_bg_crop_padding.get()
+                self.video_bg_crop_padding.get(),
             ),
-            daemon=True
+            daemon=True,
         )
         thread.start()
 
     def _remove_background_and_save_selected_frames_thread(self, selected_items, target_dir, model_name, alpha_matting, target_size, auto_crop, crop_padding):
-        """Worker thread for batch background removal and saving."""
+        """Worker thread: remove BG and save each frame sequentially.
+
+        GPU inference (predict + cutout) cannot be safely parallelised across
+        threads in PyTorch, so frames are processed one at a time.
+        """
         try:
-            from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
+            self.root.after(
+                0,
+                lambda: self.video_status_label.configure(
+                    text="Loading AI model (first run may take a moment)...",
+                    foreground=ModernStyle.TEXT_SECONDARY,
+                ),
+            )
             net = self._load_model(model_name)
-            
-            # Warm up MPS
+
+            # Warm up MPS so the first real frame doesn't appear to hang.
             if DEVICE.type == "mps":
                 _dummy = Image.new("RGB", (64, 64), (128, 128, 128))
                 _ = self._predict(net, np.array(_dummy))
@@ -3073,48 +3727,50 @@ class BackgroundRemoverApp:
                     torch.mps.synchronize()
                 del _dummy
 
-            worker_count = resolve_color_cleanup_worker_count(len(selected_items))
             total = len(selected_items)
             output_prefix = self._resolved_video_output_prefix()
+            saved_paths = []
 
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = []
-                for position, item in enumerate(selected_items, start=1):
-                    self.root.after(0, lambda p=position, t=total: self.video_status_label.configure(text=f"Removing background {p}/{t}..."))
-                    
-                    with Image.open(item["path"]) as opened_image:
-                        img = opened_image.convert("RGB")
-                    
-                    # AI removal mask
-                    mask_array = self._predict(net, np.array(img))
-                    mask = Image.fromarray(mask_array).convert("L")
-                    # Using global _mask_to_cutout
-                    cutout = _mask_to_cutout(img, mask, alpha_matting=alpha_matting)
-                    
-                    destination = os.path.join(target_dir, build_export_filename(output_prefix, position))
-                    
-                    # Finalize (includes crop)
-                    future = executor.submit(
-                        finalize_processed_cutout,
-                        cutout,
-                        destination,
-                        [], # cleanup_colors
-                        0,  # cleanup_threshold
-                        [], # exact_colors
-                        auto_crop,
-                        target_size,
-                        crop_padding
-                    )
-                    futures.append(future)
+            for position, item in enumerate(selected_items, start=1):
+                self.root.after(
+                    0,
+                    lambda p=position, t=total: self.video_status_label.configure(
+                        text=f"Removing background {p}/{t}...",
+                        foreground=ModernStyle.TEXT_SECONDARY,
+                    ),
+                )
 
-                wait(futures, return_when=ALL_COMPLETED)
-                saved_paths = [f.result() for f in futures]
+                # Load frame and run AI inference.
+                with Image.open(item["path"]) as opened_image:
+                    img = opened_image.convert("RGB")
+
+                cutout = self._create_cutout_for_image(img, net, alpha_matting)
+
+                # Ensure MPS ops finish before the next frame.
+                if DEVICE.type == "mps" and hasattr(torch.mps, "synchronize"):
+                    torch.mps.synchronize()
+
+                destination = os.path.join(target_dir, build_export_filename(output_prefix, position))
+
+                # Finalize: apply crop+padding, optional resize, save.
+                finalize_processed_cutout(
+                    cutout,
+                    destination,
+                    [],         # cleanup_colors — not applied in this path
+                    0,          # cleanup_threshold
+                    [],         # exact_colors
+                    auto_crop,
+                    target_size,
+                    crop_padding,
+                )
+                saved_paths.append(destination)
 
             self.root.after(0, lambda: self._on_background_frames_saved(saved_paths, target_dir))
         except Exception as e:
             import traceback
             traceback.print_exc()
             self.root.after(0, lambda: self._on_background_frames_save_error(str(e)))
+
 
     def _on_background_frames_saved(self, saved_paths, target_dir):
         """Handle successful batch background removal for selected frames."""
@@ -3162,10 +3818,26 @@ class BackgroundRemoverApp:
             self.pick_image_cleanup_color_btn.set_text("Click output preview to sample")
             self.input_preview_canvas.configure(cursor="")
             self.output_preview_canvas.configure(cursor="crosshair")
+        elif getattr(self, 'image_protect_color_pick_mode', 'off') != "off":
+            # Protect-color pick is active; leave cleanup button in default.
+            self.pick_image_cleanup_color_btn.set_text("Sample: off (click to cycle)")
+            cursor_mode = getattr(self, 'image_protect_color_pick_mode', 'off')
+            self.input_preview_canvas.configure(cursor="crosshair" if cursor_mode == "input" else "")
+            self.output_preview_canvas.configure(cursor="crosshair" if cursor_mode == "output" else "")
         else:
             self.pick_image_cleanup_color_btn.set_text("Sample: off (click to cycle)")
             self.input_preview_canvas.configure(cursor="")
             self.output_preview_canvas.configure(cursor="")
+
+        # Protect sample button text.
+        if getattr(self, 'pick_image_protect_color_btn', None):
+            pm = getattr(self, 'image_protect_color_pick_mode', 'off')
+            if pm == "input":
+                self.pick_image_protect_color_btn.set_text("Click input to sample")
+            elif pm == "output":
+                self.pick_image_protect_color_btn.set_text("Click output to sample")
+            else:
+                self.pick_image_protect_color_btn.set_text("Sample: off (click to cycle)")
 
         self.image_cleanup_colors_label.configure(
             text=(
@@ -3175,6 +3847,16 @@ class BackgroundRemoverApp:
         )
         self._rebuild_cleanup_swatches(self.image_cleanup_swatches_frame, self.image_cleanup_colors)
 
+        # Protected color label and swatches.
+        if getattr(self, 'image_protected_colors_label', None):
+            self.image_protected_colors_label.configure(
+                text=(
+                    f"Protected: {self._cleanup_colors_summary(self.image_protected_colors)}. "
+                    f"Tol: {self.image_protected_threshold.get()}"
+                )
+            )
+            self._rebuild_cleanup_swatches(self.image_protected_swatches_frame, self.image_protected_colors)
+
         has_input = bool(self.input_file.get()) and os.path.exists(self.input_file.get())
         if self.processing:
             self.pick_image_cleanup_color_btn.configure_state("disabled")
@@ -3182,6 +3864,10 @@ class BackgroundRemoverApp:
             self.clear_image_cleanup_colors_btn.configure_state("disabled")
             if getattr(self, "apply_cleanup_save_btn", None):
                 self.apply_cleanup_save_btn.configure_state("disabled")
+            if getattr(self, 'pick_image_protect_color_btn', None):
+                self.pick_image_protect_color_btn.configure_state("disabled")
+                self.add_image_protect_color_btn.configure_state("disabled")
+                self.clear_image_protect_colors_btn.configure_state("disabled")
             return
 
         self.pick_image_cleanup_color_btn.configure_state("normal" if has_input else "disabled")
@@ -3189,12 +3875,19 @@ class BackgroundRemoverApp:
         self.clear_image_cleanup_colors_btn.configure_state("normal" if self.image_cleanup_colors else "disabled")
         if getattr(self, "apply_cleanup_save_btn", None):
             self.apply_cleanup_save_btn.configure_state("normal" if has_input else "disabled")
+        if getattr(self, 'pick_image_protect_color_btn', None):
+            self.pick_image_protect_color_btn.configure_state("normal" if has_input else "disabled")
+            self.add_image_protect_color_btn.configure_state("normal")
+            self.clear_image_protect_colors_btn.configure_state("normal" if self.image_protected_colors else "disabled")
 
     def _on_image_cleanup_threshold_change(self, _value=None):
         self.image_cleanup_threshold_value_label.configure(text=str(self.image_cleanup_threshold.get()))
         self._refresh_image_cleanup_controls()
 
     def _toggle_image_preview_color_pick(self):
+        # Exit protect pick mode when entering cleanup pick.
+        self.image_protect_color_pick_mode = "off"
+
         has_input = bool(self.input_file.get()) and os.path.isfile(self.input_file.get())
         out_path = self.output_file.get()
         has_output = bool(out_path) and os.path.isfile(out_path)
@@ -3233,6 +3926,63 @@ class BackgroundRemoverApp:
     def _clear_image_cleanup_colors(self):
         self.image_cleanup_colors = []
         self.image_color_pick_mode = "off"
+        self._refresh_image_cleanup_controls()
+
+    # ── Image protected-color handlers ─────────────────────────────
+
+    def _on_image_protected_threshold_change(self, _value=None):
+        """Update the protect-tolerance label."""
+        if getattr(self, 'image_protected_threshold_value_label', None):
+            self.image_protected_threshold_value_label.configure(
+                text=str(self.image_protected_threshold.get())
+            )
+        self._refresh_image_cleanup_controls()
+
+    def _toggle_image_protect_color_pick(self):
+        """Cycle the image protect-color sample mode: off -> input -> output -> off."""
+        # Exit cleanup pick mode when entering protect pick.
+        self.image_color_pick_mode = "off"
+
+        has_input = bool(self.input_file.get()) and os.path.isfile(self.input_file.get())
+        out_path = self.output_file.get()
+        has_output = bool(out_path) and os.path.isfile(out_path)
+
+        mode = getattr(self, 'image_protect_color_pick_mode', 'off')
+        if mode == "off":
+            if not has_input:
+                messagebox.showerror("Error", "Select an input image before sampling a protected color.")
+                return
+            self.image_protect_color_pick_mode = "input"
+        elif mode == "input":
+            self.image_protect_color_pick_mode = "output" if has_output else "off"
+        else:
+            self.image_protect_color_pick_mode = "off"
+
+        self._refresh_image_cleanup_controls()
+
+    def _choose_image_protected_color(self):
+        """Open the system color chooser for a protected color (image tab)."""
+        chosen, hex_color = colorchooser.askcolor(
+            title="Choose Protected Color",
+            parent=self.root,
+        )
+        if chosen is None or hex_color is None:
+            return
+        color = tuple(int(round(ch)) for ch in chosen[:3])
+        self._add_image_protected_color(color)
+
+    def _add_image_protected_color(self, color):
+        """Add a normalized RGB colour to the image protected-colors list."""
+        normalized = tuple(max(0, min(255, int(ch))) for ch in color[:3])
+        if normalized not in self.image_protected_colors:
+            self.image_protected_colors.append(normalized)
+        self.image_protect_color_pick_mode = "off"
+        self._refresh_image_cleanup_controls()
+
+    def _clear_image_protected_colors(self):
+        """Clear all image protected colors."""
+        self.image_protected_colors = []
+        self.image_protect_color_pick_mode = "off"
         self._refresh_image_cleanup_controls()
 
     def _rebuild_cleanup_swatches(self, parent_frame, colors):
@@ -3488,32 +4238,48 @@ class BackgroundRemoverApp:
             img.close()
 
     def _on_input_preview_canvas_click(self, event):
-        if self.image_color_pick_mode != "input":
+        protect_mode = getattr(self, 'image_protect_color_pick_mode', 'off')
+        if self.image_color_pick_mode != "input" and protect_mode != "input":
             return
         cx = event.widget.canvasx(event.x)
         cy = event.widget.canvasy(event.y)
         sampled = self._sample_rgb_from_draw(self._input_preview_draw, cx, cy)
         if sampled is None:
             return
-        self._add_image_cleanup_color(sampled)
-        self.status_label.configure(
-            text=f"Added cleanup color {format_rgb_color(sampled)}. Matching pixels will be removed before save.",
-            foreground=ModernStyle.SUCCESS,
-        )
+        if protect_mode == "input":
+            self._add_image_protected_color(sampled)
+            self.status_label.configure(
+                text=f"Added protected color {format_rgb_color(sampled)}.",
+                foreground="#FF9500",
+            )
+        else:
+            self._add_image_cleanup_color(sampled)
+            self.status_label.configure(
+                text=f"Added cleanup color {format_rgb_color(sampled)}. Matching pixels will be removed before save.",
+                foreground=ModernStyle.SUCCESS,
+            )
 
     def _on_output_preview_canvas_click(self, event):
-        if self.image_color_pick_mode != "output":
+        protect_mode = getattr(self, 'image_protect_color_pick_mode', 'off')
+        if self.image_color_pick_mode != "output" and protect_mode != "output":
             return
         cx = event.widget.canvasx(event.x)
         cy = event.widget.canvasy(event.y)
         sampled = self._sample_rgb_from_draw(self._output_preview_draw, cx, cy)
         if sampled is None:
             return
-        self._add_image_cleanup_color(sampled)
-        self.status_label.configure(
-            text=f"Added cleanup color {format_rgb_color(sampled)} from output preview.",
-            foreground=ModernStyle.SUCCESS,
-        )
+        if protect_mode == "output":
+            self._add_image_protected_color(sampled)
+            self.status_label.configure(
+                text=f"Added protected color {format_rgb_color(sampled)} from output preview.",
+                foreground="#FF9500",
+            )
+        else:
+            self._add_image_cleanup_color(sampled)
+            self.status_label.configure(
+                text=f"Added cleanup color {format_rgb_color(sampled)} from output preview.",
+                foreground=ModernStyle.SUCCESS,
+            )
 
     def _set_last_saved_output_hint(self, path):
         if path:
@@ -3613,7 +4379,12 @@ class BackgroundRemoverApp:
                 pass
             try:
                 rgba = img.convert("RGBA")
-                cutout = apply_color_cleanup(rgba, self.image_cleanup_colors, self.image_cleanup_threshold.get())
+                cutout = apply_color_cleanup(
+                    rgba, self.image_cleanup_colors,
+                    self.image_cleanup_threshold.get(),
+                    protected_colors=self.image_protected_colors,
+                    protected_threshold=self.image_protected_threshold.get(),
+                )
                 if self.auto_crop_output.get():
                     cutout = crop_to_visible_bounds(cutout)
                 cutout.save(self.output_file.get(), "PNG")
@@ -3937,6 +4708,8 @@ class BackgroundRemoverApp:
                 cutout,
                 self.image_cleanup_colors,
                 self.image_cleanup_threshold.get(),
+                protected_colors=self.image_protected_colors,
+                protected_threshold=self.image_protected_threshold.get(),
             )
             if self.auto_crop_output.get():
                 cutout = crop_to_visible_bounds(cutout)
