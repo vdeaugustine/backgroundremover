@@ -782,6 +782,9 @@ class VideoTabMixin:
         )
 
         if filename:
+            # Force a clean state -- if a prior operation left the app in a
+            # broken processing state, loading a new video should always recover.
+            self.video_processing = False
             self.video_file.set(filename)
             self.video_output_prefix.set(os.path.splitext(os.path.basename(filename))[0])
             self._reset_extracted_frames(clear_cleanup_colors=True)
@@ -1005,6 +1008,10 @@ class VideoTabMixin:
                 ``selected_var`` value from incoming items so that
                 user selections survive operations like color cleanup.
         """
+        # Snapshot the input list upfront so we are never iterating the
+        # same list object that we are about to clear via self.frame_items.
+        incoming = list(frame_items)
+
         for child in self.frame_list_inner.winfo_children():
             child.destroy()
 
@@ -1016,7 +1023,7 @@ class VideoTabMixin:
         self.preview_color_pick_active = False
         self._refresh_video_cleanup_controls()
 
-        for item in frame_items:
+        for item in incoming:
             frame_item = dict(item)
             # Preserve existing selection when the caller asks for it
             # (e.g. after color cleanup or background removal).
@@ -1025,6 +1032,18 @@ class VideoTabMixin:
             initial_value = was_selected if preserve_selection else False
             frame_item["selected_var"] = tk.BooleanVar(value=initial_value)
             frame_item["widget"] = None
+
+            # Regenerate thumbnail from the (possibly updated) file on disk
+            # so the sidebar reflects the current image state.
+            try:
+                with Image.open(frame_item["path"]) as opened:
+                    thumb = opened.copy()
+                    thumb.thumbnail((92, 72), Image.Resampling.LANCZOS)
+                    frame_item["thumbnail"] = thumb
+                    frame_item["size"] = opened.size
+            except Exception:
+                pass  # keep the existing thumbnail/size if the file cannot be read
+
             self.frame_items.append(frame_item)
             self._add_frame_thumbnail(frame_item)
 
@@ -2186,15 +2205,30 @@ class VideoTabMixin:
 
         Preserves existing frame selections so the user does not have
         to re-select all frames after every cleanup or BG removal.
+
+        Wrapped in try/except so a failure in the UI rebuild never
+        leaves the app in a permanently broken state with disabled buttons.
         """
-        self.video_processing = False
-        self.video_progress.stop()
-        self._rebuild_frame_list(self.frame_items, preserve_selection=True)
-        self._set_video_action_states(is_busy=False)
-        self.video_status_label.configure(
-            text="Processed frames updated in preview.",
-            foreground=ModernStyle.SUCCESS,
-        )
+        try:
+            self.video_processing = False
+            self.video_progress.stop()
+            self._rebuild_frame_list(self.frame_items, preserve_selection=True)
+            self._set_video_action_states(is_busy=False)
+            self.video_status_label.configure(
+                text="Processed frames updated in preview.",
+                foreground=ModernStyle.SUCCESS,
+            )
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            # Ensure the app is always recoverable.
+            self.video_processing = False
+            self.video_progress.stop()
+            self._set_video_action_states(is_busy=False)
+            self.video_status_label.configure(
+                text=f"Preview refresh failed: {exc}. Frames may still be recoverable with Undo.",
+                foreground=ModernStyle.ERROR,
+            )
 
     def _save_selected_frames_thread(self, selected_items, target_dir, target_size=None):
         """Copy selected frame PNGs to the final output folder, optionally resizing them."""
@@ -2237,15 +2271,20 @@ class VideoTabMixin:
         messagebox.showinfo("Success", f"Saved {len(saved_paths)} frame(s) to:\n\n{target_dir}")
 
     def _on_frame_save_error(self, error_msg):
-        """Handle frame export failure"""
+        """Handle frame export or inline-processing failure.
+
+        Always re-enables UI controls so the user can retry, undo, or
+        load a new video without restarting the app.
+        """
         self.video_processing = False
         self.video_progress.stop()
         self._set_video_action_states(is_busy=False)
         self.video_status_label.configure(
-            text="Saving selected frames failed.",
+            text=f"Processing failed: {error_msg[:120]}",
             foreground=ModernStyle.ERROR,
         )
-        messagebox.showerror("Error", f"Failed to save selected frames:\n\n{error_msg}")
+        messagebox.showerror("Error", f"Processing failed:\n\n{error_msg}")
+
     def remove_background_and_save_selected_frames(self):
         """Batch remove backgrounds from selected frames and save them to the output directory."""
         if not self.frame_items:

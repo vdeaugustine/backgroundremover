@@ -28,6 +28,8 @@ class BackgroundRemoverApp(ShellMixin, ImageTabMixin, VideoTabMixin):
 
         self.input_file = tk.StringVar()
         self.output_file = tk.StringVar()
+        self.image_input_files = []
+        self.image_output_prefix = tk.StringVar()
         self.sprite_output_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads"))
         self.model_choice = tk.StringVar(value="u2net")
         self.alpha_matting = tk.BooleanVar(value=False)
@@ -67,6 +69,7 @@ class BackgroundRemoverApp(ShellMixin, ImageTabMixin, VideoTabMixin):
         self.video_protected_colors = []
         self.video_protected_threshold = tk.IntVar(value=COLOR_PROTECT_THRESHOLD_DEFAULT)
         self.preview_color_pick_active = False
+        self.exact_preview_color_pick_active = False
         self.video_protect_color_pick_active = False
         self.image_cleanup_colors = []
         self.image_exact_cleanup_colors = []

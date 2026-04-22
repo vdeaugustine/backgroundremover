@@ -82,7 +82,7 @@ class ImageTabMixin:
         input_frame = ttk.Frame(file_frame)
         input_frame.pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Label(input_frame, text="Input Image").pack(anchor=tk.W)
+        ttk.Label(input_frame, text="Input Image(s)").pack(anchor=tk.W)
         
         input_entry_frame = ttk.Frame(input_frame)
         input_entry_frame.pack(fill=tk.X, pady=(5, 0))
@@ -99,7 +99,7 @@ class ImageTabMixin:
                                    highlightcolor=ModernStyle.ACCENT)
         self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(0, 10))
         
-        self.browse_input_btn = RoundedButton(input_entry_frame, text="Browse",
+        self.browse_input_btn = RoundedButton(input_entry_frame, text="Upload",
                                             command=self.browse_input,
                                             width=100, height=36,
                                             bg=ModernStyle.BG_TERTIARY,
@@ -110,7 +110,7 @@ class ImageTabMixin:
         output_frame = ttk.Frame(file_frame)
         output_frame.pack(fill=tk.X, pady=(10, 0))
         
-        ttk.Label(output_frame, text="Output File").pack(anchor=tk.W)
+        ttk.Label(output_frame, text="Output File / Batch Folder").pack(anchor=tk.W)
         
         output_entry_frame = ttk.Frame(output_frame)
         output_entry_frame.pack(fill=tk.X, pady=(5, 0))
@@ -133,6 +133,25 @@ class ImageTabMixin:
                                              bg=ModernStyle.BG_TERTIARY,
                                              hover_bg=ModernStyle.BORDER)
         self.browse_output_btn.pack(side=tk.RIGHT)
+
+        prefix_frame = ttk.Frame(output_frame)
+        prefix_frame.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Label(prefix_frame, text="Batch Name Prefix").pack(side=tk.LEFT, padx=(0, 10))
+
+        self.image_output_prefix_entry = tk.Entry(
+            prefix_frame,
+            textvariable=self.image_output_prefix,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_PRIMARY,
+            insertbackground=ModernStyle.TEXT_PRIMARY,
+            relief=tk.FLAT,
+            font=ModernStyle.FONT_BODY,
+            highlightthickness=1,
+            highlightbackground=ModernStyle.BORDER,
+            highlightcolor=ModernStyle.ACCENT,
+        )
+        self.image_output_prefix_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
 
         output_actions = ttk.Frame(output_frame)
         output_actions.pack(fill=tk.X, pady=(8, 0))
@@ -179,7 +198,7 @@ class ImageTabMixin:
 
         ttk.Label(
             output_frame,
-            text="Remove Background writes to the Output File path above. Use Save output as… to copy elsewhere.",
+            text="Single images save to the Output File. Multiple images save in order to the batch folder as prefix_1.png, prefix_2.png, and so on.",
             style="Small.TLabel",
         ).pack(anchor=tk.W, pady=(2, 0))
 
@@ -741,7 +760,9 @@ class ImageTabMixin:
         self.add_image_cleanup_color_btn.configure_state("normal")
         self.clear_image_cleanup_colors_btn.configure_state("normal" if self.image_cleanup_colors else "disabled")
         if getattr(self, "apply_cleanup_save_btn", None):
-            self.apply_cleanup_save_btn.configure_state("normal" if has_input else "disabled")
+            self.apply_cleanup_save_btn.configure_state(
+                "normal" if has_input and not self._is_image_batch_mode() else "disabled"
+            )
         if getattr(self, 'pick_image_protect_color_btn', None):
             self.pick_image_protect_color_btn.configure_state("normal" if has_input else "disabled")
             self.add_image_protect_color_btn.configure_state("normal")
@@ -1154,16 +1175,47 @@ class ImageTabMixin:
         else:
             self.last_saved_output_hint.set("")
 
+    def _selected_image_input_paths(self):
+        """Return the currently selected image paths, preserving upload order."""
+        single_path = (self.input_file.get() or "").strip()
+        paths = [
+            path for path in getattr(self, "image_input_files", [])
+            if path and os.path.isfile(path)
+        ]
+        if paths:
+            if single_path and single_path not in paths and os.path.isfile(single_path):
+                return [single_path]
+            return paths
+
+        if single_path and os.path.isfile(single_path):
+            return [single_path]
+        return []
+
+    def _is_image_batch_mode(self):
+        return len(self._selected_image_input_paths()) > 1
+
+    def _default_image_output_prefix(self):
+        input_paths = self._selected_image_input_paths()
+        first_path = input_paths[0] if input_paths else ""
+        return os.path.splitext(os.path.basename(first_path))[0] or "image"
+
+    def _resolved_image_output_prefix(self):
+        return resolve_output_prefix(
+            self.image_output_prefix.get(),
+            self._default_image_output_prefix(),
+        )
+
     def _refresh_output_action_buttons(self):
         if getattr(self, "use_output_as_input_btn", None) is None:
             return
         out_path = self.output_file.get()
         has_output_file = bool(out_path) and os.path.isfile(out_path)
+        has_output_location = bool(out_path) and (os.path.isfile(out_path) or os.path.isdir(out_path))
         busy = self.processing
         self.use_output_as_input_btn.configure_state("normal" if has_output_file and not busy else "disabled")
         self.save_output_copy_btn.configure_state("normal" if has_output_file and not busy else "disabled")
         if sys.platform == "darwin" and getattr(self, "reveal_output_btn", None):
-            self.reveal_output_btn.configure_state("normal" if has_output_file and not busy else "disabled")
+            self.reveal_output_btn.configure_state("normal" if has_output_location and not busy else "disabled")
 
     def use_output_as_input(self):
         """Set the current output file as the input image for cleanup refinement."""
@@ -1171,6 +1223,7 @@ class ImageTabMixin:
         if not out_path or not os.path.isfile(out_path):
             messagebox.showerror("Error", "No saved output file found. Run Remove Background or Apply cleanup & save first.")
             return
+        self.image_input_files = [out_path]
         self.input_file.set(out_path)
         self.load_input_preview(out_path)
         self._refresh_output_action_buttons()
@@ -1208,7 +1261,8 @@ class ImageTabMixin:
             messagebox.showerror("Error", "No output file to reveal.")
             return
         try:
-            subprocess.run(["open", "-R", path], check=False)
+            command = ["open", path] if os.path.isdir(path) else ["open", "-R", path]
+            subprocess.run(command, check=False)
         except OSError as exc:
             messagebox.showerror("Error", f"Could not reveal file:\n{exc}")
 
@@ -1218,6 +1272,9 @@ class ImageTabMixin:
         out_path = (self.output_file.get() or "").strip()
         if not in_path or not os.path.isfile(in_path):
             messagebox.showerror("Error", "Select an input image file first.")
+            return
+        if self._is_image_batch_mode():
+            messagebox.showerror("Error", "Apply cleanup & save is only available for one image at a time.")
             return
         if not out_path:
             messagebox.showerror("Error", "Specify an output file path.")
@@ -1300,18 +1357,34 @@ class ImageTabMixin:
             ("All files", "*.*")
         ]
         
-        filename = filedialog.askopenfilename(
-            title="Select Input Image",
+        filenames = filedialog.askopenfilenames(
+            title="Select Input Image(s)",
             filetypes=filetypes
         )
         
-        if filename:
-            self.input_file.set(filename)
-            self.load_input_preview(filename)
-            
-            # Always update output filename when input changes
-            base, ext = os.path.splitext(filename)
-            self.output_file.set(f"{base}_no_bg.png")
+        if filenames:
+            paths = list(filenames)
+            self.image_input_files = paths
+            first_path = paths[0]
+            self.input_file.set(first_path)
+            self.load_input_preview(first_path)
+
+            base, _ext = os.path.splitext(first_path)
+            prefix = resolve_output_prefix(os.path.basename(base), "image")
+            self.image_output_prefix.set(prefix)
+
+            if len(paths) == 1:
+                self.output_file.set(f"{base}_no_bg.png")
+                self.status_label.configure(
+                    text="1 image selected.",
+                    foreground=ModernStyle.TEXT_SECONDARY,
+                )
+            else:
+                self.output_file.set(os.path.join(os.path.expanduser("~"), "Downloads"))
+                self.status_label.configure(
+                    text=f"{len(paths)} images selected. They will process sequentially.",
+                    foreground=ModernStyle.TEXT_SECONDARY,
+                )
             self.output_preview_display_path = None
             self.load_output_preview()
 
@@ -1322,12 +1395,24 @@ class ImageTabMixin:
             ("All files", "*.*")
         ]
         
+        if self._is_image_batch_mode():
+            directory = filedialog.askdirectory(
+                title="Choose Folder For Batch Images",
+                initialdir=self.output_file.get() or os.path.join(os.path.expanduser("~"), "Downloads"),
+            )
+
+            if directory:
+                self.output_file.set(directory)
+                self.output_preview_display_path = None
+                self.load_output_preview()
+            return
+
         filename = filedialog.asksaveasfilename(
             title="Save Output As",
             defaultextension=".png",
             filetypes=filetypes
         )
-        
+
         if filename:
             self.output_file.set(filename)
             self.output_preview_display_path = None
@@ -1346,6 +1431,8 @@ class ImageTabMixin:
     def load_input_preview(self, filepath):
         """Load and display input image preview on the zoomable canvas."""
         self.input_file.set(filepath)
+        if not getattr(self, "image_input_files", None):
+            self.image_input_files = [filepath]
         self._redraw_input_preview()
         self._refresh_output_action_buttons()
 
@@ -1360,17 +1447,33 @@ class ImageTabMixin:
     
     def process_image(self):
         """Start image processing"""
-        if not self.input_file.get():
-            messagebox.showerror("Error", "Please select an input image.")
+        input_paths = self._selected_image_input_paths()
+        if not input_paths:
+            messagebox.showerror("Error", "Please select at least one input image.")
             return
         
         if not self.output_file.get():
-            messagebox.showerror("Error", "Please specify an output file.")
+            messagebox.showerror("Error", "Please specify an output file or batch folder.")
             return
-        
-        if not os.path.exists(self.input_file.get()):
-            messagebox.showerror("Error", "Input file does not exist.")
-            return
+
+        is_batch = len(input_paths) > 1
+        if is_batch:
+            target_dir = self.output_file.get()
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror("Error", f"Could not create output folder:\n{exc}")
+                return
+            if not self.image_output_prefix.get().strip():
+                self.image_output_prefix.set(self._default_image_output_prefix())
+        else:
+            parent_dir = os.path.dirname(self.output_file.get())
+            if parent_dir:
+                try:
+                    os.makedirs(parent_dir, exist_ok=True)
+                except OSError as exc:
+                    messagebox.showerror("Error", f"Could not create output folder:\n{exc}")
+                    return
         
         if self.processing:
             return
@@ -1378,12 +1481,17 @@ class ImageTabMixin:
         self.processing = True
         self.process_btn.configure_state("disabled")
         self.sprite_process_btn.configure_state("disabled")
+        if getattr(self, "apply_cleanup_save_btn", None):
+            self.apply_cleanup_save_btn.configure_state("disabled")
         self.progress.start(10)
-        self.status_label.configure(text="Processing... Please wait.")
+        if is_batch:
+            self.status_label.configure(text=f"Processing 1/{len(input_paths)}... Please wait.")
+        else:
+            self.status_label.configure(text="Processing... Please wait.")
         self._refresh_image_cleanup_controls()
         self._refresh_output_action_buttons()
 
-        thread = threading.Thread(target=self._process_thread)
+        thread = threading.Thread(target=self._process_thread, args=(input_paths,))
         thread.daemon = True
         thread.start()
 
@@ -1555,36 +1663,61 @@ class ImageTabMixin:
         fallback_name = os.path.splitext(os.path.basename(self.video_file.get()))[0] or "video"
         return resolve_output_prefix(self.video_output_prefix.get(), fallback_name)
     
-    def _process_thread(self):
+    def _process_thread(self, input_paths=None):
         """Background processing thread"""
         try:
-            # Load image
-            img = Image.open(self.input_file.get())
-            try:
-                from PIL import ImageOps
-                img = ImageOps.exif_transpose(img)
-            except Exception:
-                pass
-            img = img.convert("RGB")
-            
-            # Load model
+            input_paths = input_paths or self._selected_image_input_paths()
+            if not input_paths:
+                raise ValueError("No input images selected.")
+
             net = self._load_model(self.model_choice.get())
-            
-            cutout = self._create_cutout_for_image(img, net, self.alpha_matting.get())
-            cutout = apply_color_cleanup(
-                cutout,
-                self.image_cleanup_colors,
-                self.image_cleanup_threshold.get(),
-                protected_colors=self.image_protected_colors,
-                protected_threshold=self.image_protected_threshold.get(),
-            )
-            if self.auto_crop_output.get():
-                cutout = crop_to_visible_bounds(cutout)
-            
-            # Save
-            cutout.save(self.output_file.get(), "PNG")
-            
-            self.root.after(0, self._on_success)
+            saved_paths = []
+            total = len(input_paths)
+            output_prefix = self._resolved_image_output_prefix()
+
+            for position, input_path in enumerate(input_paths, start=1):
+                self.root.after(
+                    0,
+                    lambda current=position, t=total: self.status_label.configure(
+                        text=f"Processing image {current}/{t}...",
+                        foreground=ModernStyle.TEXT_SECONDARY,
+                    ),
+                )
+
+                img = Image.open(input_path)
+                try:
+                    from PIL import ImageOps
+                    img = ImageOps.exif_transpose(img)
+                except Exception:
+                    pass
+
+                try:
+                    rgb_img = img.convert("RGB")
+                    cutout = self._create_cutout_for_image(rgb_img, net, self.alpha_matting.get())
+                    cutout = apply_color_cleanup(
+                        cutout,
+                        self.image_cleanup_colors,
+                        self.image_cleanup_threshold.get(),
+                        protected_colors=self.image_protected_colors,
+                        protected_threshold=self.image_protected_threshold.get(),
+                    )
+                    if self.auto_crop_output.get():
+                        cutout = crop_to_visible_bounds(cutout)
+
+                    if total == 1:
+                        destination = self.output_file.get()
+                    else:
+                        destination = os.path.join(
+                            self.output_file.get(),
+                            build_export_filename(output_prefix, position),
+                        )
+
+                    cutout.save(destination, "PNG")
+                    saved_paths.append(destination)
+                finally:
+                    img.close()
+
+            self.root.after(0, lambda: self._on_success(saved_paths))
             
         except Exception as e:
             import traceback
@@ -1611,19 +1744,38 @@ class ImageTabMixin:
             traceback.print_exc()
             self.root.after(0, lambda: self._on_error(str(e)))
     
-    def _on_success(self):
+    def _on_success(self, saved_paths=None):
         """Called on successful processing"""
+        saved_paths = saved_paths or [self.output_file.get()]
         self.processing = False
         self.progress.stop()
         self.process_btn.configure_state("normal")
         self.sprite_process_btn.configure_state("normal")
+        if getattr(self, "apply_cleanup_save_btn", None):
+            self.apply_cleanup_save_btn.configure_state("normal")
         self._refresh_image_cleanup_controls()
-        self.status_label.configure(text="✓ Background removed successfully!", foreground=ModernStyle.SUCCESS)
+        self._refresh_output_action_buttons()
 
-        self._set_last_saved_output_hint(self.output_file.get())
-        self.load_output_preview()
+        if len(saved_paths) == 1:
+            self.status_label.configure(text="✓ Background removed successfully!", foreground=ModernStyle.SUCCESS)
+            self.output_file.set(saved_paths[0])
+            self._set_last_saved_output_hint(saved_paths[0])
+            self.load_output_preview()
+            messagebox.showinfo("Success", f"Background removed!\n\nSaved to:\n{saved_paths[0]}")
+            return
 
-        messagebox.showinfo("Success", f"Background removed!\n\nSaved to:\n{self.output_file.get()}")
+        target_dir = os.path.dirname(saved_paths[0]) if saved_paths else self.output_file.get()
+        self.status_label.configure(
+            text=f"✓ Backgrounds removed for {len(saved_paths)} image(s)!",
+            foreground=ModernStyle.SUCCESS,
+        )
+        self._set_last_saved_output_hint(target_dir)
+        if saved_paths:
+            self.load_output_preview(saved_paths[0])
+        messagebox.showinfo(
+            "Success",
+            f"Background removed for {len(saved_paths)} image(s)!\n\nSaved to:\n{target_dir}",
+        )
 
     def _on_sprite_kit_success(self, result, target_dir):
         """Called on successful sprite-kit export."""
@@ -1659,6 +1811,8 @@ class ImageTabMixin:
         self.progress.stop()
         self.process_btn.configure_state("normal")
         self.sprite_process_btn.configure_state("normal")
+        if getattr(self, "apply_cleanup_save_btn", None):
+            self.apply_cleanup_save_btn.configure_state("normal")
         self._refresh_image_cleanup_controls()
         self._refresh_output_action_buttons()
         self.status_label.configure(text="✗ Processing failed", foreground=ModernStyle.ERROR)
